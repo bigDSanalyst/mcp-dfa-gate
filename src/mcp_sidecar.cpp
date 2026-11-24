@@ -1,0 +1,1025 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#include "lattice_engine.hpp"
+#include "generated_policy.hpp"
+
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#if defined(__linux__) && __has_include(<linux/openat2.h>)
+#include <linux/openat2.h>
+#define MCP_GATE_HAVE_OPENAT2_H 1
+#endif
+
+namespace {
+
+using mcp_lattice::LatticeEngine;
+
+constexpr std::size_t kMaxLine = 1u << 20;
+
+constexpr int kErrParse = -32700;
+constexpr int kErrInvalidRequest = -32600;
+constexpr int kErrPolicyDenied = -32001;
+constexpr int kErrCanonicalization = -32002;
+constexpr int kErrMethodBlocked = -32004;
+
+namespace json {
+
+struct Node {
+  enum class Type : std::uint8_t { kNull, kBool, kNum, kStr, kArr, kObj };
+  Type type = Type::kNull;
+  bool b = false;
+  std::string str;
+  std::string raw;
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  std::vector<Node> items;
+  std::vector<std::pair<std::string, Node>> members;
+
+  const Node* find(std::string_view key) const {
+    if (type != Type::kObj) return nullptr;
+    for (const auto& kv : members) {
+      if (kv.first == key) return &kv.second;
+    }
+    return nullptr;
+  }
+};
+
+class Parser {
+ public:
+  Parser(std::string_view src, bool strict) : src_(src), strict_(strict) {}
+
+  void skip_ws() {
+    while (i_ < src_.size() &&
+           (src_[i_] == ' ' || src_[i_] == '\t' || src_[i_] == '\r')) {
+      ++i_;
+    }
+  }
+
+  bool parse_value(Node& out, std::size_t depth) {
+    if (depth > 64) return fail();
+    skip_ws();
+    if (i_ >= src_.size()) return fail();
+    out = Node{};
+    out.begin = i_;
+
+    const char c = src_[i_];
+    if (c == '{') return parse_obj(out, depth);
+    if (c == '[') return parse_arr(out, depth);
+    if (c == '"') {
+      out.type = Node::Type::kStr;
+      if (!parse_string(out.str)) return false;
+    } else if (c == 't') {
+      if (src_.compare(i_, 4, "true") != 0) return fail();
+      i_ += 4;
+      out.type = Node::Type::kBool;
+      out.b = true;
+    } else if (c == 'f') {
+      if (src_.compare(i_, 5, "false") != 0) return fail();
+      i_ += 5;
+      out.type = Node::Type::kBool;
+    } else if (c == 'n') {
+      if (src_.compare(i_, 4, "null") != 0) return fail();
+      i_ += 4;
+      out.type = Node::Type::kNull;
+    } else {
+      if (src_[i_] == '-') ++i_;
+      bool digits = false;
+      while (i_ < src_.size()) {
+        const char d = src_[i_];
+        if (d >= '0' && d <= '9') {
+          digits = true;
+          ++i_;
+        } else if (d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-') {
+          ++i_;
+        } else {
+          break;
+        }
+      }
+      if (!digits) return fail();
+      out.type = Node::Type::kNum;
+    }
+    out.end = i_;
+    out.raw = std::string(src_.substr(out.begin, out.end - out.begin));
+    return ok;
+  }
+
+  bool ok = true;
+
+  void set_end_check() {
+    skip_ws();
+    ok = ok && (i_ == src_.size());
+  }
+
+ private:
+  bool fail() {
+    ok = false;
+    return false;
+  }
+
+  bool parse_string(std::string& out) {
+    ++i_;
+    out.clear();
+    while (i_ < src_.size()) {
+      const auto c = static_cast<unsigned char>(src_[i_]);
+      if (c == '"') {
+        ++i_;
+        return true;
+      }
+      if (c < 0x20 || c == 0x7F) return fail();
+      if (c >= 0x80) {
+        if (strict_) return fail();
+        out += static_cast<char>(c);
+        ++i_;
+        continue;
+      }
+      if (c == '\\') {
+        ++i_;
+        if (i_ >= src_.size()) return fail();
+        const char e = src_[i_++];
+        switch (e) {
+          case '"': out += '"'; break;
+          case '\\': out += '\\'; break;
+          case '/': out += '/'; break;
+          case 'b': out += '\b'; break;
+          case 'f': out += '\f'; break;
+          case 'n': out += '\n'; break;
+          case 'r': out += '\r'; break;
+          case 't': out += '\t'; break;
+          case 'u': {
+            unsigned cp = 0;
+            for (int k = 0; k < 4; ++k) {
+              if (i_ >= src_.size()) return fail();
+              const char h = src_[i_++];
+              cp <<= 4;
+              if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+              else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+              else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+              else return fail();
+            }
+            if (cp >= 0x80 && strict_) return fail();
+            out += (cp >= 0x80) ? '?' : static_cast<char>(cp);
+            break;
+          }
+          default: return fail();
+        }
+        continue;
+      }
+      out += static_cast<char>(c);
+      ++i_;
+    }
+    return fail();
+  }
+
+  bool parse_arr(Node& out, std::size_t depth) {
+    out.type = Node::Type::kArr;
+    ++i_;
+    skip_ws();
+    if (i_ < src_.size() && src_[i_] == ']') {
+      ++i_;
+      out.end = i_;
+      out.raw = std::string(src_.substr(out.begin, out.end - out.begin));
+      return ok;
+    }
+    while (ok) {
+      Node item;
+      if (!parse_value(item, depth + 1)) return false;
+      out.items.push_back(std::move(item));
+      skip_ws();
+      if (i_ >= src_.size()) return fail();
+      if (src_[i_] == ',') {
+        ++i_;
+        continue;
+      }
+      if (src_[i_] == ']') {
+        ++i_;
+        out.end = i_;
+        out.raw = std::string(src_.substr(out.begin, out.end - out.begin));
+        return ok;
+      }
+      return fail();
+    }
+    return false;
+  }
+
+  bool parse_obj(Node& out, std::size_t depth) {
+    out.type = Node::Type::kObj;
+    ++i_;
+    skip_ws();
+    if (i_ < src_.size() && src_[i_] == '}') {
+      ++i_;
+      out.end = i_;
+      out.raw = std::string(src_.substr(out.begin, out.end - out.begin));
+      return ok;
+    }
+    while (ok) {
+      skip_ws();
+      if (i_ >= src_.size() || src_[i_] != '"') return fail();
+      std::string key;
+      if (!parse_string(key)) return false;
+      if (strict_) {
+        for (const auto& kv : out.members) {
+          if (kv.first == key) return fail();
+        }
+      }
+      skip_ws();
+      if (i_ >= src_.size() || src_[i_] != ':') return fail();
+      ++i_;
+      Node val;
+      if (!parse_value(val, depth + 1)) return false;
+      out.members.emplace_back(std::move(key), std::move(val));
+      skip_ws();
+      if (i_ >= src_.size()) return fail();
+      if (src_[i_] == ',') {
+        ++i_;
+        continue;
+      }
+      if (src_[i_] == '}') {
+        ++i_;
+        out.end = i_;
+        out.raw = std::string(src_.substr(out.begin, out.end - out.begin));
+        return ok;
+      }
+      return fail();
+    }
+    return false;
+  }
+
+  std::string_view src_;
+  bool strict_;
+  std::size_t i_ = 0;
+};
+
+bool parse(const std::string& line, Node& out, bool strict) {
+  Parser p(line, strict);
+  if (!p.parse_value(out, 0)) return false;
+  p.set_end_check();
+  return p.ok;
+}
+
+}  // namespace json
+
+bool write_all(int fd, std::string_view data) {
+  std::size_t off = 0;
+  while (off < data.size()) {
+    const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  return true;
+}
+
+bool emit(int fd, std::string_view msg) {
+  return write_all(fd, msg) && write_all(fd, "\n");
+}
+
+class LineReader {
+ public:
+  explicit LineReader(int fd) : fd_(fd) {}
+
+  bool next(std::string& line) {
+    line.clear();
+    for (;;) {
+      const std::size_t pos = pending_.find('\n');
+      if (pos != std::string::npos) {
+        line = pending_.substr(0, pos);
+        pending_.erase(0, pos + 1);
+        return true;
+      }
+      if (pending_.size() > kMaxLine) return false;
+      char buf[8192];
+      const ssize_t n = ::read(fd_, buf, sizeof buf);
+      if (n == 0) return false;
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+      pending_.append(buf, static_cast<std::size_t>(n));
+    }
+  }
+
+ private:
+  int fd_;
+  std::string pending_;
+};
+
+std::string json_escape(std::string_view s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  out += '"';
+  for (const auto u : s) {
+    const auto c = static_cast<unsigned char>(u);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20 || c >= 0x80) {
+          char b[8];
+          std::snprintf(b, sizeof b, "\\u%04X", static_cast<unsigned>(c));
+          out += b;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  out += '"';
+  return out;
+}
+
+std::string make_error(const std::string& id_raw, int code, std::string_view msg) {
+  std::string out = "{\"jsonrpc\":\"2.0\",\"id\":";
+  out += id_raw.empty() ? "null" : id_raw;
+  out += ",\"error\":{\"code\":";
+  out += std::to_string(code);
+  out += ",\"message\":";
+  out += json_escape(msg);
+  out += "}}";
+  return out;
+}
+
+#if defined(__linux__) && !defined(MCP_GATE_HAVE_OPENAT2_H)
+struct open_how {
+  std::uint64_t flags;
+  std::uint64_t mode;
+  std::uint64_t resolve;
+};
+constexpr std::uint64_t RESOLVE_NO_MAGICLINKS = 0x02;
+constexpr std::uint64_t RESOLVE_NO_SYMLINKS = 0x04;
+constexpr std::uint64_t RESOLVE_BENEATH = 0x08;
+#endif
+
+bool is_clean_ascii_path(std::string_view p) {
+  for (const char c : p) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u >= 0x80 || u < 0x20 || u == 0x7F) return false;
+  }
+  return true;
+}
+
+std::optional<std::string> readlink_fd(int fd) {
+  char linkbuf[64];
+  std::snprintf(linkbuf, sizeof linkbuf, "/proc/self/fd/%d", fd);
+  char path[4096];
+  const ssize_t n = ::readlink(linkbuf, path, sizeof path - 1);
+  if (n <= 0 || static_cast<std::size_t>(n) >= sizeof path - 1) return std::nullopt;
+  path[n] = '\0';
+  return std::string(path);
+}
+
+std::optional<std::string> canonicalize_nofollow(int ws_fd, std::string_view rel) {
+  int cur = ::dup(ws_fd);
+  if (cur < 0) return std::nullopt;
+  std::optional<std::string> result;
+  std::size_t i = 0;
+  bool ok = true;
+  while (i < rel.size() && ok) {
+    while (i < rel.size() && rel[i] == '/') ++i;
+    const std::size_t j = i;
+    while (i < rel.size() && rel[i] != '/') ++i;
+    if (j == i) break;
+    const std::string comp(rel.substr(j, i - j));
+    if (comp == ".") continue;
+    if (comp == "..") {
+      ok = false;
+      break;
+    }
+    const int next = ::openat(cur, comp.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (next < 0) {
+      ok = false;
+      break;
+    }
+    struct stat st {};
+    const bool is_last = (i >= rel.size());
+    if (::fstat(next, &st) != 0 ||
+        (!is_last && !S_ISDIR(st.st_mode)) ||
+        (is_last && !S_ISREG(st.st_mode))) {
+      ::close(next);
+      ok = false;
+      break;
+    }
+    ::close(cur);
+    cur = next;
+  }
+  if (ok) result = readlink_fd(cur);
+  ::close(cur);
+  return result;
+}
+
+namespace detail {
+[[nodiscard]] constexpr char ascii_lower(char ch) noexcept {
+  return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + ('a' - 'A')) : ch;
+}
+[[nodiscard]] constexpr bool ends_with_icase(std::string_view str, std::string_view suffix) noexcept {
+  if (str.size() < suffix.size()) return false;
+  const std::size_t offset = str.size() - suffix.size();
+  for (std::size_t i = 0; i < suffix.size(); ++i) {
+    if (ascii_lower(str[offset + i]) != ascii_lower(suffix[i])) return false;
+  }
+  return true;
+}
+}  // namespace detail
+
+[[nodiscard]] bool is_safe_workspace_path(std::string_view path, std::string_view safe_prefix) noexcept {
+  if (safe_prefix.size() < 2 || safe_prefix.front() != '/' || safe_prefix.back() != '/') return false;
+  if (path.size() <= safe_prefix.size() || path.back() == '/') return false;
+  if (path.substr(0, safe_prefix.size()) != safe_prefix) return false;
+  if (path.find("..") != std::string_view::npos ||
+      path.find("//") != std::string_view::npos ||
+      path.find("/.") != std::string_view::npos) {
+    return false;
+  }
+  constexpr std::array<std::string_view, 6> blocked_suffixes = {
+      ".pem", ".key", ".p12", ".sql", ".env", ".kdbx"};
+  for (const auto suffix : blocked_suffixes) {
+    if (detail::ends_with_icase(path, suffix)) return false;
+  }
+  return true;
+}
+
+std::optional<std::string> canonicalize_path(
+    int ws_fd,
+    const std::string& path,
+    std::string_view safe_prefix
+) {
+  if (!is_clean_ascii_path(path)) return std::nullopt;
+  if (path.size() <= safe_prefix.size()) return std::nullopt;
+  if (path.compare(0, safe_prefix.size(), safe_prefix) != 0) return std::nullopt;
+
+  const std::string rel = path.substr(safe_prefix.size());
+  if (rel.empty() || rel[0] == '/') return std::nullopt;
+
+  std::optional<std::string> res;
+#if defined(__linux__) && defined(SYS_openat2)
+  {
+    open_how how {};
+    how.flags = static_cast<std::uint64_t>(O_PATH) |
+                static_cast<std::uint64_t>(O_NOFOLLOW) |
+                static_cast<std::uint64_t>(O_CLOEXEC);
+    how.mode = 0;
+    how.resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH;
+    const long fd = ::syscall(SYS_openat2, ws_fd, rel.c_str(), &how, sizeof how);
+    if (fd >= 0) {
+      struct stat st {};
+      if (::fstat(static_cast<int>(fd), &st) == 0 && S_ISREG(st.st_mode)) {
+        res = readlink_fd(static_cast<int>(fd));
+      } else {
+        ::close(static_cast<int>(fd));
+        return std::nullopt;
+      }
+      ::close(static_cast<int>(fd));
+    } else if (errno != ENOSYS && errno != EINVAL) {
+      return std::nullopt;
+    }
+  }
+#endif
+  if (!res) {
+    res = canonicalize_nofollow(ws_fd, rel);
+  }
+  if (!res || !is_clean_ascii_path(*res)) return std::nullopt;
+  if (res->size() <= safe_prefix.size() ||
+      res->compare(0, safe_prefix.size(), safe_prefix) != 0) {
+    return std::nullopt;
+  }
+  return res;
+}
+
+constexpr std::array<std::string_view, 10> kVettedCommands = {
+    "ls", "cat", "head", "tail", "grep",
+    "find", "wc", "diff", "stat", "sha256sum"};
+
+constexpr std::array<std::string_view, 8> kFindBlockedFlags = {
+    "-exec", "-execdir", "-ok", "-okdir", "-delete",
+    "-fprint", "-fprintf", "-fls"};
+
+bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_prefix) {
+  std::string rel;
+  if (!t.empty() && t[0] == '/') {
+    if (t.size() <= safe_prefix.size() || t.substr(0, safe_prefix.size()) != safe_prefix) {
+      return true;
+    }
+    rel = std::string(t.substr(safe_prefix.size()));
+  } else {
+    rel = std::string(t);
+  }
+  if (rel.empty() || rel == ".") return false;
+#if defined(__linux__) && defined(SYS_openat2)
+  open_how how {};
+  how.flags = static_cast<std::uint64_t>(O_PATH) |
+              static_cast<std::uint64_t>(O_NOFOLLOW) |
+              static_cast<std::uint64_t>(O_CLOEXEC);
+  how.mode = 0;
+  how.resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH;
+  const long fd = ::syscall(SYS_openat2, ws_fd, rel.c_str(), &how, sizeof how);
+  if (fd >= 0) {
+    struct stat st {};
+    const bool is_lnk = (::fstat(static_cast<int>(fd), &st) != 0 || S_ISLNK(st.st_mode));
+    ::close(static_cast<int>(fd));
+    return is_lnk;
+  }
+  if (errno == ELOOP || errno == EXDEV) return true;
+  if (errno == ENOENT || errno == ENOTDIR) return false;
+#endif
+  struct stat st {};
+  if (::fstatat(ws_fd, rel.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode)) {
+    return true;
+  }
+  return false;
+}
+
+bool is_vetted_command(std::string_view cmd, std::string_view safe_prefix, int ws_fd) {
+  if (cmd.empty()) return false;
+  for (const char c : cmd) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u >= 0x80 || u < 0x20 || u == 0x7F) return false;
+    switch (c) {
+      case ';': case '|': case '&': case '`': case '$': case '>': case '<':
+      case '(': case ')': case '{': case '}': case '[': case ']': case '!':
+      case '#': case '"': case '\'': case '\\': case '~': case '*': case '?':
+        return false;
+      default: break;
+    }
+  }
+  if (cmd.find("..") != std::string_view::npos ||
+      cmd.find("/.") != std::string_view::npos) {
+    return false;
+  }
+
+  std::vector<std::string_view> tokens;
+  std::size_t i = 0;
+  while (i < cmd.size()) {
+    while (i < cmd.size() && (cmd[i] == ' ' || cmd[i] == '\t')) ++i;
+    const std::size_t j = i;
+    while (i < cmd.size() && cmd[i] != ' ' && cmd[i] != '\t') ++i;
+    if (i > j) tokens.push_back(cmd.substr(j, i - j));
+  }
+  if (tokens.empty()) return false;
+
+  bool program_ok = false;
+  for (const auto v : kVettedCommands) {
+    if (tokens[0] == v) {
+      program_ok = true;
+      break;
+    }
+  }
+  if (!program_ok) return false;
+
+  if (tokens[0] == "find") {
+    for (const auto t : tokens) {
+      for (const auto bad : kFindBlockedFlags) {
+        if (t == bad) return false;
+      }
+    }
+  }
+
+  for (std::size_t k = 1; k < tokens.size(); ++k) {
+    const std::string_view t = tokens[k];
+    if (t.empty()) continue;
+    if (t[0] == '-') {
+      if (t.find('/') != std::string_view::npos ||
+          t.find('=') != std::string_view::npos) {
+        return false;
+      }
+      continue;
+    }
+    if (t != "." && t[0] == '.') return false;
+    constexpr std::array<std::string_view, 6> blocked_suffixes = {
+        ".pem", ".key", ".p12", ".sql", ".env", ".kdbx"};
+    for (const auto suffix : blocked_suffixes) {
+      if (detail::ends_with_icase(t, suffix)) return false;
+    }
+    if (t[0] == '/') {
+      if (safe_prefix.empty() || t.size() <= safe_prefix.size()) return false;
+      if (t.substr(0, safe_prefix.size()) != safe_prefix) return false;
+    }
+    if (token_hits_symlink(ws_fd, t, safe_prefix)) return false;
+  }
+  return true;
+}
+
+enum class ToolCategory : std::uint8_t {
+  SAFE_READ = 0,
+  SENSITIVE_READ,
+  NETWORK_OUTBOUND,
+  EXEC_WORKSPACE,
+  UNKNOWN
+};
+
+struct Classification {
+  ToolCategory category = ToolCategory::UNKNOWN;
+  bool canonical_ok = true;
+  std::string forward_arg;
+};
+
+Classification classify_for_gate(std::string_view tool, const json::Node* arguments,
+                                 std::string_view safe_prefix, int ws_fd) {
+  Classification out;
+  const char* key = (tool == "read_file") ? "path"
+                  : (tool == "bash_workspace") ? "command"
+                  : "url";
+  const json::Node* arg = nullptr;
+  if (arguments != nullptr && arguments->type == json::Node::Type::kObj) {
+    arg = arguments->find(key);
+  }
+  const bool have_arg = (arg != nullptr && arg->type == json::Node::Type::kStr);
+
+  if (tool == "read_file") {
+    const std::string raw_path = have_arg ? arg->str : std::string();
+    auto canon = canonicalize_path(ws_fd, raw_path, safe_prefix);
+    if (!canon) {
+      out.category = ToolCategory::SENSITIVE_READ;
+      out.canonical_ok = false;
+      return out;
+    }
+    out.forward_arg = *canon;
+    out.category = is_safe_workspace_path(*canon, safe_prefix)
+                       ? ToolCategory::SAFE_READ
+                       : ToolCategory::SENSITIVE_READ;
+    return out;
+  }
+  if (tool == "http_fetch" || tool == "fetch_url") {
+    out.forward_arg = have_arg ? arg->str : std::string();
+    out.category = ToolCategory::NETWORK_OUTBOUND;
+    return out;
+  }
+  if (tool == "bash_workspace") {
+    const std::string cmd = have_arg ? arg->str : std::string();
+    if (!is_vetted_command(cmd, safe_prefix, ws_fd)) {
+      out.category = ToolCategory::UNKNOWN;
+      return out;
+    }
+    out.forward_arg = cmd;
+    out.category = ToolCategory::EXEC_WORKSPACE;
+    return out;
+  }
+  out.category = ToolCategory::UNKNOWN;
+  return out;
+}
+
+std::string build_forwarded_call(const std::string& id_raw, bool is_notification,
+                                 std::string_view tool, std::string_view forward_arg) {
+  std::string out = "{\"jsonrpc\":\"2.0\"";
+  if (!is_notification) {
+    out += ",\"id\":";
+    out += id_raw.empty() ? "null" : id_raw;
+  }
+  out += ",\"method\":\"tools/call\",\"params\":{\"name\":";
+  out += json_escape(tool);
+  out += ",\"arguments\":{";
+  if (tool == "read_file") {
+    out += "\"path\":";
+  } else if (tool == "bash_workspace") {
+    out += "\"command\":";
+  } else {
+    out += "\"url\":";
+  }
+  out += json_escape(forward_arg);
+  out += "}}}";
+  return out;
+}
+
+struct Child {
+  pid_t pid = -1;
+  int to_child = -1;
+  int from_child = -1;
+};
+
+bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out) {
+  int in_pipe[2];
+  int out_pipe[2];
+  if (::pipe(in_pipe) != 0) return false;
+  if (::pipe(out_pipe) != 0) {
+    ::close(in_pipe[0]);
+    ::close(in_pipe[1]);
+    return false;
+  }
+  ::fcntl(in_pipe[1], F_SETFD, FD_CLOEXEC);
+  ::fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
+
+  std::vector<char*> argv;
+  argv.reserve(cmdv.size() + 1);
+  for (const auto& s : cmdv) argv.push_back(const_cast<char*>(s.c_str()));
+  argv.push_back(nullptr);
+
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    ::close(in_pipe[0]);
+    ::close(in_pipe[1]);
+    ::close(out_pipe[0]);
+    ::close(out_pipe[1]);
+    return false;
+  }
+  if (pid == 0) {
+    ::dup2(in_pipe[0], STDIN_FILENO);
+    ::dup2(out_pipe[1], STDOUT_FILENO);
+    ::close(in_pipe[0]);
+    ::close(in_pipe[1]);
+    ::close(out_pipe[0]);
+    ::close(out_pipe[1]);
+    ::execvp(argv[0], argv.data());
+    ::_exit(127);
+  }
+  ::close(in_pipe[0]);
+  ::close(out_pipe[1]);
+  out.pid = pid;
+  out.to_child = in_pipe[1];
+  out.from_child = out_pipe[0];
+  return true;
+}
+
+bool method_allowed(std::string_view m) {
+  constexpr std::array<std::string_view, 6> kPass = {
+      "initialize", "ping", "tools/list", "tools/call",
+      "initialized", "notifications/initialized"};
+  for (const auto k : kPass) {
+    if (m == k) return true;
+  }
+  return false;
+}
+
+enum class RelayResult { kOk, kLost };
+
+bool id_matches(const json::Node& id, const std::string& id_raw) {
+  if (id.raw == id_raw) return true;
+  if (id.type == json::Node::Type::kNum) {
+    const double a = std::strtod(id.raw.c_str(), nullptr);
+    const double b = std::strtod(id_raw.c_str(), nullptr);
+    return a == b;
+  }
+  return false;
+}
+
+RelayResult relay_matching(LineReader& child, const std::string& id_raw) {
+  std::string line;
+  while (child.next(line)) {
+    json::Node msg;
+    if (!json::parse(line, msg, /*strict=*/false)) {
+      std::fprintf(stderr, "[mcp-dfa-gate] dropped unparseable downstream output\n");
+      continue;
+    }
+    const json::Node* method = msg.find("method");
+    const json::Node* id = msg.find("id");
+    if (method != nullptr || id == nullptr) {
+      std::fprintf(stderr, "[mcp-dfa-gate] dropped downstream notification\n");
+      continue;
+    }
+    if (!id_matches(*id, id_raw)) {
+      std::fprintf(stderr, "[mcp-dfa-gate] dropped mismatched downstream response\n");
+      continue;
+    }
+    if (!emit(STDOUT_FILENO, line)) return RelayResult::kLost;
+    return RelayResult::kOk;
+  }
+  return RelayResult::kLost;
+}
+
+bool prefix_self_check(const std::string& safe_prefix) {
+  if (safe_prefix.size() < 2 || safe_prefix.front() != '/' || safe_prefix.back() != '/') {
+    return false;
+  }
+  for (const char c : safe_prefix) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u < 0x20 || u == 0x7F || c == '\\') return false;
+  }
+  if (safe_prefix.find("..") != std::string::npos) return false;
+  LatticeEngine probe;
+  const auto r = probe.inspect_tool("read_file", false);
+  return r.allowed;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  ::signal(SIGPIPE, SIG_IGN);
+
+  std::string safe_prefix = "/workspace/public/";
+  std::vector<std::string> downstream;
+  {
+    bool seen_ddash = false;
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (!seen_ddash && a == "--") {
+        seen_ddash = true;
+        continue;
+      }
+      if (seen_ddash) downstream.push_back(a);
+      else safe_prefix = a;
+    }
+    if (downstream.empty()) {
+      std::fprintf(stderr, "usage: mcp-dfa-gate [SAFE_PREFIX] -- DOWNSTREAM argv...\n");
+      return 2;
+    }
+  }
+  if (safe_prefix.empty() || safe_prefix[0] != '/') {
+    std::fprintf(stderr, "[mcp-dfa-gate] SAFE_PREFIX must be an absolute path\n");
+    return 2;
+  }
+  if (safe_prefix.back() != '/') safe_prefix += '/';
+  if (!prefix_self_check(safe_prefix)) {
+    std::fprintf(stderr, "[mcp-dfa-gate] SAFE_PREFIX rejected by startup self-check\n");
+    return 2;
+  }
+
+  const int ws_fd = ::open(safe_prefix.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (ws_fd < 0) {
+    std::fprintf(stderr, "[mcp-dfa-gate] cannot open workspace root '%s': %s\n",
+                 safe_prefix.c_str(), std::strerror(errno));
+    return 2;
+  }
+
+  LatticeEngine engine;
+  std::fprintf(stderr, "[mcp-dfa-gate] Policy: %.*s (SHA-256: %.*s)\n",
+               static_cast<int>(mcp_lattice::policy::POLICY_NAME.size()),
+               mcp_lattice::policy::POLICY_NAME.data(),
+               static_cast<int>(mcp_lattice::policy::POLICY_SHA256.size()),
+               mcp_lattice::policy::POLICY_SHA256.data());
+
+  long timeout_secs = 600;
+  if (const char* t = std::getenv("MCP_GATE_TIMEOUT_SECS")) {
+    const long v = std::atol(t);
+    if (v >= 0) timeout_secs = v;
+  }
+  if (timeout_secs > 0) {
+    ::signal(SIGALRM, [](int) { ::_exit(42); });
+  }
+
+  Child child;
+  if (!spawn_downstream(downstream, child)) {
+    std::fprintf(stderr, "[mcp-dfa-gate] failed to spawn downstream server\n");
+    ::close(ws_fd);
+    return 3;
+  }
+
+  LineReader client_in(STDIN_FILENO);
+  LineReader child_out(child.from_child);
+  std::string line;
+  unsigned long seq = 0;
+
+  while (client_in.next(line)) {
+    ++seq;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+
+    bool ascii_ok = true;
+    for (const char c : line) {
+      const auto u = static_cast<unsigned char>(c);
+      if (u >= 0x80 || (u < 0x20 && c != '\t')) {
+        ascii_ok = false;
+        break;
+      }
+    }
+    if (!ascii_ok) {
+      emit(STDOUT_FILENO, make_error("null", kErrParse,
+                                     "non-ASCII or control byte rejected (strict 7-bit transport)"));
+      continue;
+    }
+
+    json::Node req;
+    if (!json::parse(line, req, /*strict=*/true) ||
+        req.type != json::Node::Type::kObj) {
+      emit(STDOUT_FILENO, make_error("null", kErrParse, "invalid JSON-RPC message"));
+      continue;
+    }
+
+    const json::Node* id_n = req.find("id");
+    const bool is_notification = (id_n == nullptr);
+    if (!is_notification &&
+        id_n->type != json::Node::Type::kStr &&
+        id_n->type != json::Node::Type::kNum &&
+        id_n->type != json::Node::Type::kNull) {
+      emit(STDOUT_FILENO, make_error("null", kErrInvalidRequest, "invalid JSON-RPC id type"));
+      continue;
+    }
+    const std::string id_raw = is_notification ? std::string() : id_n->raw;
+
+    const json::Node* method_n = req.find("method");
+    if (method_n == nullptr || method_n->type != json::Node::Type::kStr) {
+      emit(STDOUT_FILENO, make_error(id_raw, kErrInvalidRequest, "missing method"));
+      continue;
+    }
+    const std::string& method = method_n->str;
+
+    if (!method_allowed(method)) {
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] seq=%lu method=\"%s\" BLOCKED (fail-closed method policy)\n",
+                   seq, method.c_str());
+      if (!is_notification) {
+        emit(STDOUT_FILENO, make_error(id_raw, kErrMethodBlocked,
+                                       "method blocked by mcp-dfa-gate (fail-closed)"));
+      }
+      continue;
+    }
+
+    if (method == "tools/call") {
+      const json::Node* params = req.find("params");
+      const json::Node* name_n = (params != nullptr) ? params->find("name") : nullptr;
+      const std::string tool =
+          (name_n != nullptr && name_n->type == json::Node::Type::kStr)
+              ? name_n->str : std::string();
+      const json::Node* arguments = (params != nullptr) ? params->find("arguments") : nullptr;
+
+      const Classification cls =
+          classify_for_gate(tool, arguments, safe_prefix, ws_fd);
+      const bool is_sensitive = (cls.category == ToolCategory::SENSITIVE_READ);
+      // Fail closed if classifier marked UNKNOWN (e.g. unvetted bash_workspace command)
+      const std::string_view effective_tool =
+          (cls.category == ToolCategory::UNKNOWN) ? std::string_view("") : std::string_view(tool);
+      const auto r = engine.inspect_tool(effective_tool, is_sensitive);
+      const auto st_after = engine.state();
+
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] seq=%lu tool=\"%s\" taint=0x%016llx allowed=%d\n",
+                   seq, tool.c_str(),
+                   static_cast<unsigned long long>(st_after.taint),
+                   r.allowed ? 1 : 0);
+
+      if (!r.allowed) {
+        if (!is_notification) {
+          emit(STDOUT_FILENO, make_error(id_raw, kErrPolicyDenied, r.reason));
+        }
+        continue;
+      }
+      if (!cls.canonical_ok) {
+        if (!is_notification) {
+          emit(STDOUT_FILENO,
+               make_error(id_raw, kErrCanonicalization,
+                          "path canonicalization failed; treated as sensitive; call refused"));
+        }
+        continue;
+      }
+
+      const std::string forwarded =
+          build_forwarded_call(id_raw, is_notification, tool, cls.forward_arg);
+      if (!is_notification && timeout_secs > 0) {
+        ::alarm(static_cast<unsigned>(timeout_secs));
+      }
+      if (!emit(child.to_child, forwarded)) {
+        std::fprintf(stderr, "[mcp-dfa-gate] downstream write failed\n");
+        ::close(ws_fd);
+        return 3;
+      }
+      if (!is_notification) {
+        if (relay_matching(child_out, id_raw) != RelayResult::kOk) {
+          std::fprintf(stderr, "[mcp-dfa-gate] downstream server lost\n");
+          ::close(ws_fd);
+          return 3;
+        }
+        if (timeout_secs > 0) ::alarm(0);
+      }
+      continue;
+    }
+
+    if (is_notification) {
+      if (!emit(child.to_child, line)) {
+        ::close(ws_fd);
+        return 3;
+      }
+      continue;
+    }
+    if (timeout_secs > 0) ::alarm(static_cast<unsigned>(timeout_secs));
+    if (!emit(child.to_child, line)) {
+      ::close(ws_fd);
+      return 3;
+    }
+    if (relay_matching(child_out, id_raw) != RelayResult::kOk) {
+      std::fprintf(stderr, "[mcp-dfa-gate] downstream server lost\n");
+      ::close(ws_fd);
+      return 3;
+    }
+    if (timeout_secs > 0) ::alarm(0);
+  }
+
+  ::close(ws_fd);
+  if (child.pid > 0) {
+    ::kill(child.pid, SIGTERM);
+    int status = 0;
+    ::waitpid(child.pid, &status, 0);
+  }
+  return 0;
+}

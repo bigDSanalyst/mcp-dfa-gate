@@ -1,0 +1,4 @@
+mcp-dfa-gate
+*.o
+__pycache__/
+lean_out.txt

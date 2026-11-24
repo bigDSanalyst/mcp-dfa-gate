@@ -1,0 +1,28 @@
+{
+  "policy_name": "enterprise_zero_exfil_v1",
+  "labels": [
+    "SECRETS",
+    "PII",
+    "PROD_DB",
+    "UNTRUSTED_WEB",
+    "EXEC"
+  ],
+  "tools": {
+    "read_file": {
+      "taint": [],
+      "clearance": ["SECRETS", "PII", "PROD_DB", "UNTRUSTED_WEB", "EXEC"]
+    },
+    "http_fetch": {
+      "taint": ["UNTRUSTED_WEB"],
+      "clearance": ["UNTRUSTED_WEB"]
+    },
+    "fetch_url": {
+      "taint": ["UNTRUSTED_WEB"],
+      "clearance": ["UNTRUSTED_WEB"]
+    },
+    "bash_workspace": {
+      "taint": [],
+      "clearance": ["UNTRUSTED_WEB", "EXEC"]
+    }
+  }
+}

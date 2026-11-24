@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  verify-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile policy, build C++20 sidecar, and run 24 hostile tests
+        run: |
+          make policy
+          make build
+          make test
+
+      - name: Install Lean 4 and verify universal Non-Interference proof
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
+          export PATH="$HOME/.elan/bin:$PATH"
+          make verify | tee lean_out.txt
+          if grep -q "sorryAx" lean_out.txt; then
+            echo "ERROR: sorryAx detected in Lean proof"
+            exit 1
+          fi
