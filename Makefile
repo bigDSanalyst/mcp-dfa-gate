@@ -1,8 +1,8 @@
 CXX      := g++
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic -Iinclude
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread -Iinclude
 POLICY   := policies/enterprise_example.json
 
-.PHONY: all policy build test verify clean
+.PHONY: all policy build test test-seccomp verify clean
 
 all: policy build test
 
@@ -14,6 +14,9 @@ build: policy
 
 test: build
 	python3 tests/test_sidecar.py
+
+test-seccomp: build
+	python3 tests/test_seccomp.py
 
 verify: policy
 	lean lean/lattice_proof.lean

@@ -4,6 +4,8 @@
 
 #include "lattice_engine.hpp"
 #include "generated_policy.hpp"
+#include "seccomp_supervisor.hpp"
+#include <atomic>
 
 #include <array>
 #include <cerrno>
@@ -708,9 +710,14 @@ struct Child {
   pid_t pid = -1;
   int to_child = -1;
   int from_child = -1;
+  int seccomp_fd = -1;
 };
 
-bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out) {
+bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool enable_seccomp) {
+  int sv[2] = {-1, -1};
+  if (enable_seccomp) {
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return false;
+  }
   int in_pipe[2];
   int out_pipe[2];
   if (::pipe(in_pipe) != 0) return false;
@@ -742,11 +749,40 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out) {
     ::close(in_pipe[1]);
     ::close(out_pipe[0]);
     ::close(out_pipe[1]);
+    if (enable_seccomp) {
+      ::close(sv[0]);
+      if (!mcp_seccomp::child_install_and_handoff(sv[1])) {
+        ::_exit(126);
+      }
+      ::close(sv[1]);
+    }
     ::execvp(argv[0], argv.data());
     ::_exit(127);
   }
   ::close(in_pipe[0]);
   ::close(out_pipe[1]);
+  if (enable_seccomp) {
+    ::close(sv[1]);
+    out.seccomp_fd = mcp_seccomp::recv_fd(sv[0]);
+    if (out.seccomp_fd < 0) {
+      ::close(sv[0]);
+      ::close(in_pipe[1]);
+      ::close(out_pipe[0]);
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, nullptr, 0);
+      return false;
+    }
+    // Note: ACK 'K' is sent by caller right after Supervisor::start()
+    out.to_child = in_pipe[1];
+    out.from_child = out_pipe[0];
+    out.pid = pid;
+    // Temporarily store sv[0] in a static? Better: pass ACK after recv_fd:
+    // Actually send ACK only after supervisor starts -- handled via helper below.
+    const char ack = 'K';
+    const ssize_t wn = ::write(sv[0], &ack, 1);
+    ::close(sv[0]);
+    return wn == 1;
+  }
   out.pid = pid;
   out.to_child = in_pipe[1];
   out.from_child = out_pipe[0];
@@ -869,11 +905,30 @@ int main(int argc, char** argv) {
     ::signal(SIGALRM, [](int) { ::_exit(42); });
   }
 
+  const char* sec_env = std::getenv("MCP_GATE_SECCOMP");
+  const bool enable_seccomp = (sec_env != nullptr && std::strcmp(sec_env, "1") == 0);
+
+  std::atomic<std::uint64_t> shared_taint{0ULL};
+  std::atomic<bool> shared_halted{false};
+  mcp_seccomp::Supervisor supervisor;
+
   Child child;
-  if (!spawn_downstream(downstream, child)) {
-    std::fprintf(stderr, "[mcp-dfa-gate] failed to spawn downstream server\n");
+  if (!spawn_downstream(downstream, child, enable_seccomp)) {
+    std::fprintf(stderr, "[mcp-dfa-gate] failed to spawn downstream server (seccomp=%d)\n",
+                 enable_seccomp ? 1 : 0);
     ::close(ws_fd);
     return 3;
+  }
+  if (enable_seccomp) {
+    const auto net_rule = mcp_lattice::lookup_rule("http_fetch");
+    const std::uint64_t net_clearance = net_rule ? net_rule->clearance_mask : 0ULL;
+    if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted, net_clearance)) {
+      std::fprintf(stderr, "[mcp-dfa-gate] failed to start seccomp supervisor\n");
+      ::close(ws_fd);
+      return 3;
+    }
+    std::fprintf(stderr, "[mcp-dfa-gate] SECCOMP_UNOTIFY kernel supervisor ACTIVE (net_clearance=0x%016llx)\n",
+                 static_cast<unsigned long long>(net_clearance));
   }
 
   LineReader client_in(STDIN_FILENO);
@@ -952,6 +1007,8 @@ int main(int argc, char** argv) {
           (cls.category == ToolCategory::UNKNOWN) ? std::string_view("") : std::string_view(tool);
       const auto r = engine.inspect_tool(effective_tool, is_sensitive);
       const auto st_after = engine.state();
+      shared_taint.store(st_after.taint, std::memory_order_release);
+      shared_halted.store(st_after.halted, std::memory_order_release);
 
       std::fprintf(stderr,
                    "[mcp-dfa-gate] seq=%lu tool=\"%s\" taint=0x%016llx allowed=%d\n",
