@@ -922,13 +922,18 @@ int main(int argc, char** argv) {
   if (enable_seccomp) {
     const auto net_rule = mcp_lattice::lookup_rule("http_fetch");
     const std::uint64_t net_clearance = net_rule ? net_rule->clearance_mask : 0ULL;
-    if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted, net_clearance)) {
+    const auto exec_rule = mcp_lattice::lookup_rule("bash_workspace");
+    const std::uint64_t exec_clearance = exec_rule ? exec_rule->clearance_mask : 0ULL;
+    if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted,
+                          net_clearance, exec_clearance)) {
       std::fprintf(stderr, "[mcp-dfa-gate] failed to start seccomp supervisor\n");
       ::close(ws_fd);
       return 3;
     }
-    std::fprintf(stderr, "[mcp-dfa-gate] SECCOMP_UNOTIFY kernel supervisor ACTIVE (net_clearance=0x%016llx)\n",
-                 static_cast<unsigned long long>(net_clearance));
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] SECCOMP_UNOTIFY ACTIVE (net=0x%016llx exec=0x%016llx)\n",
+                 static_cast<unsigned long long>(net_clearance),
+                 static_cast<unsigned long long>(exec_clearance));
   }
 
   LineReader client_in(STDIN_FILENO);

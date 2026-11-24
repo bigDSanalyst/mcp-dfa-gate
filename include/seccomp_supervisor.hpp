@@ -64,17 +64,32 @@ inline int recv_fd(int sock) noexcept {
   return fd;
 }
 
-// Called in child process right before execvp().
-// Installs SECCOMP_RET_USER_NOTIF on SYS_connect, sends listener FD to parent,
-// and waits for 1-byte ACK so supervisor thread is active before execvp().
 inline bool child_install_and_handoff(int sock) noexcept {
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     return false;
   }
   struct sock_filter filter[] = {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+#ifdef SYS_io_uring_setup
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+#endif
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_connect, 0, 1),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendto, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendmsg, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+#ifdef SYS_sendmmsg
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_sendmmsg, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+#endif
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_execve, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+#ifdef SYS_execveat
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_execveat, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+#endif
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
   struct sock_fprog prog = {
@@ -105,12 +120,13 @@ class Supervisor {
   bool start(int listener_fd,
              const std::atomic<std::uint64_t>* taint_mask,
              const std::atomic<bool>* halted,
-             std::uint64_t net_clearance_mask) {
+             std::uint64_t net_clearance_mask,
+             std::uint64_t exec_clearance_mask) {
     if (listener_fd < 0) return false;
     listener_fd_ = listener_fd;
     stop_flag_.store(false, std::memory_order_relaxed);
-    thread_ = std::thread([this, taint_mask, halted, net_clearance_mask]() {
-      run_loop(taint_mask, halted, net_clearance_mask);
+    thread_ = std::thread([this, taint_mask, halted, net_clearance_mask, exec_clearance_mask]() {
+      run_loop(taint_mask, halted, net_clearance_mask, exec_clearance_mask);
     });
     return true;
   }
@@ -129,7 +145,8 @@ class Supervisor {
  private:
   void run_loop(const std::atomic<std::uint64_t>* taint_mask,
                 const std::atomic<bool>* halted,
-                std::uint64_t net_clearance_mask) {
+                std::uint64_t net_clearance_mask,
+                std::uint64_t exec_clearance_mask) {
     while (!stop_flag_.load(std::memory_order_acquire)) {
       struct pollfd pfd {};
       pfd.fd = listener_fd_;
@@ -144,9 +161,16 @@ class Supervisor {
         break;
       }
 
+      const int nr = req.data.nr;
+      bool is_exec = (nr == SYS_execve);
+#ifdef SYS_execveat
+      if (nr == SYS_execveat) is_exec = true;
+#endif
+      const std::uint64_t clearance = is_exec ? exec_clearance_mask : net_clearance_mask;
+
       const bool is_halted = halted->load(std::memory_order_acquire);
       const std::uint64_t taint = taint_mask->load(std::memory_order_acquire);
-      const bool block = is_halted || ((taint & ~net_clearance_mask) != 0ULL);
+      const bool block = is_halted || ((taint & ~clearance) != 0ULL);
 
       struct seccomp_notif_resp resp {};
       resp.id = req.id;
@@ -155,8 +179,8 @@ class Supervisor {
         resp.val = 0;
         resp.flags = 0;
         std::fprintf(stderr,
-                     "[mcp-dfa-gate] SECCOMP_UNOTIFY DENIED SYS_connect (taint=0x%016llx halted=%d)\n",
-                     static_cast<unsigned long long>(taint), is_halted ? 1 : 0);
+                     "[mcp-dfa-gate] SECCOMP_UNOTIFY DENIED nr=%d (taint=0x%016llx halted=%d)\n",
+                     nr, static_cast<unsigned long long>(taint), is_halted ? 1 : 0);
       } else {
         resp.error = 0;
         resp.val = 0;
@@ -176,7 +200,8 @@ inline bool child_install_and_handoff(int) noexcept { return false; }
 inline int recv_fd(int) noexcept { return -1; }
 class Supervisor {
  public:
-  bool start(int, const std::atomic<std::uint64_t>*, const std::atomic<bool>*, std::uint64_t) {
+  bool start(int, const std::atomic<std::uint64_t>*, const std::atomic<bool>*,
+             std::uint64_t, std::uint64_t) {
     return false;
   }
   void stop() {}
