@@ -711,6 +711,7 @@ struct Child {
   int to_child = -1;
   int from_child = -1;
   int seccomp_fd = -1;
+  int handoff_sock = -1;
 };
 
 bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool enable_seccomp) {
@@ -763,7 +764,7 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool ena
   ::close(out_pipe[1]);
   if (enable_seccomp) {
     ::close(sv[1]);
-    out.seccomp_fd = mcp_seccomp::recv_fd(sv[0]);
+    out.seccomp_fd = mcp_seccomp::parent_fetch_listener_fd(sv[0], pid);
     if (out.seccomp_fd < 0) {
       ::close(sv[0]);
       ::close(in_pipe[1]);
@@ -772,16 +773,11 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool ena
       ::waitpid(pid, nullptr, 0);
       return false;
     }
-    // Note: ACK 'K' is sent by caller right after Supervisor::start()
+    out.handoff_sock = sv[0];
     out.to_child = in_pipe[1];
     out.from_child = out_pipe[0];
     out.pid = pid;
-    // Temporarily store sv[0] in a static? Better: pass ACK after recv_fd:
-    // Actually send ACK only after supervisor starts -- handled via helper below.
-    const char ack = 'K';
-    const ssize_t wn = ::write(sv[0], &ack, 1);
-    ::close(sv[0]);
-    return wn == 1;
+    return true;
   }
   out.pid = pid;
   out.to_child = in_pipe[1];
@@ -927,6 +923,16 @@ int main(int argc, char** argv) {
     if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted,
                           net_clearance, exec_clearance)) {
       std::fprintf(stderr, "[mcp-dfa-gate] failed to start seccomp supervisor\n");
+      ::close(child.handoff_sock);
+      ::close(ws_fd);
+      return 3;
+    }
+    const char ack = 'K';
+    const ssize_t wn = ::write(child.handoff_sock, &ack, 1);
+    ::close(child.handoff_sock);
+    child.handoff_sock = -1;
+    if (wn != 1) {
+      std::fprintf(stderr, "[mcp-dfa-gate] seccomp handoff ACK failed\n");
       ::close(ws_fd);
       return 3;
     }

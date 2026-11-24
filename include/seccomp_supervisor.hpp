@@ -16,59 +16,36 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#if defined(__linux__) && __has_include(<linux/seccomp.h>) && __has_include(<linux/filter.h>)
+#if defined(__linux__) && __has_include(<linux/seccomp.h>) && __has_include(<linux/filter.h>) && __has_include(<linux/audit.h>)
+#include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #endif
 
 namespace mcp_seccomp {
 
-#if defined(__linux__) && defined(SECCOMP_RET_USER_NOTIF) && defined(SECCOMP_IOCTL_NOTIF_RECV)
+#if defined(__linux__) && defined(SECCOMP_RET_USER_NOTIF) && defined(SECCOMP_IOCTL_NOTIF_RECV) && defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 
-inline bool send_fd(int sock, int fd) noexcept {
-  char dummy = 'F';
-  struct iovec iov { &dummy, 1 };
-  alignas(struct cmsghdr) char cbuf[CMSG_SPACE(sizeof(int))] = {};
-  struct msghdr msg {};
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  msg.msg_control = cbuf;
-  msg.msg_controllen = sizeof(cbuf);
+#if defined(__x86_64__)
+inline constexpr std::uint32_t kExpectedArch = AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+inline constexpr std::uint32_t kExpectedArch = AUDIT_ARCH_AARCH64;
+#else
+#error "Unsupported architecture for seccomp BPF audit check"
+#endif
 
-  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-  cmsg->cmsg_level = SOL_SOCKET;
-  cmsg->cmsg_type = SCM_RIGHTS;
-  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-  std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-  return ::sendmsg(sock, &msg, 0) == 1;
-}
-
-inline int recv_fd(int sock) noexcept {
-  char dummy = 0;
-  struct iovec iov { &dummy, 1 };
-  alignas(struct cmsghdr) char cbuf[CMSG_SPACE(sizeof(int))] = {};
-  struct msghdr msg {};
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  msg.msg_control = cbuf;
-  msg.msg_controllen = sizeof(cbuf);
-
-  if (::recvmsg(sock, &msg, 0) <= 0) return -1;
-  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-    return -1;
-  }
-  int fd = -1;
-  std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-  return fd;
-}
-
+// Child installs BPF filter, writes listener FD integer over unfiltered SYS_write,
+// and blocks on SYS_read until parent duplicates the FD and starts the supervisor.
 inline bool child_install_and_handoff(int sock) noexcept {
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     return false;
   }
   struct sock_filter filter[] = {
+      // Enforce native architecture to block 32-bit compat syscall number bypass
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kExpectedArch, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
 #ifdef SYS_io_uring_setup
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 0, 1),
@@ -101,12 +78,32 @@ inline bool child_install_and_handoff(int sock) noexcept {
   if (listener_fd < 0) {
     return false;
   }
-  const bool sent = send_fd(sock, static_cast<int>(listener_fd));
-  ::close(static_cast<int>(listener_fd));
-  if (!sent) return false;
+
+  const int fd_num = static_cast<int>(listener_fd);
+  if (::write(sock, &fd_num, sizeof(fd_num)) != static_cast<ssize_t>(sizeof(fd_num))) {
+    ::close(fd_num);
+    return false;
+  }
 
   char ack = 0;
-  return ::read(sock, &ack, 1) == 1 && ack == 'K';
+  const bool ok = (::read(sock, &ack, 1) == 1 && ack == 'K');
+  ::close(fd_num);
+  return ok;
+}
+
+// Parent reads child's listener FD number and duplicates it via pidfd_getfd (no sendmsg).
+inline int parent_fetch_listener_fd(int sock, pid_t child_pid) noexcept {
+  int child_fd = -1;
+  if (::read(sock, &child_fd, sizeof(child_fd)) != static_cast<ssize_t>(sizeof(child_fd))) {
+    return -1;
+  }
+  const long pidfd = ::syscall(SYS_pidfd_open, child_pid, 0U);
+  if (pidfd < 0) {
+    return -1;
+  }
+  const long dup_fd = ::syscall(SYS_pidfd_getfd, static_cast<int>(pidfd), child_fd, 0U);
+  ::close(static_cast<int>(pidfd));
+  return (dup_fd >= 0) ? static_cast<int>(dup_fd) : -1;
 }
 
 class Supervisor {
@@ -197,7 +194,7 @@ class Supervisor {
 
 #else
 inline bool child_install_and_handoff(int) noexcept { return false; }
-inline int recv_fd(int) noexcept { return -1; }
+inline int parent_fetch_listener_fd(int, pid_t) noexcept { return -1; }
 class Supervisor {
  public:
   bool start(int, const std::atomic<std::uint64_t>*, const std::atomic<bool>*,
