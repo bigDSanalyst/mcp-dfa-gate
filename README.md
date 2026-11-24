@@ -36,3 +36,9 @@ For production OS confinement (read-only workspace bind mount + `cwd` lock):
 ```
 
 See `SECURITY.md` for the exact threat model and out-of-scope boundaries.
+
+## License
+
+Copyright (c) 2026 Nicholas Clifford Maino III.
+
+`mcp-dfa-gate` is dual-licensed under the **GNU Affero General Public License v3.0 (AGPLv3)** (see `LICENSE`) and a **Commercial License** (see `COMMERCIAL.md`) for proprietary production deployments.
