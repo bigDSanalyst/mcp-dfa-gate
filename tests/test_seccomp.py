@@ -1134,7 +1134,11 @@ class TestFenceStrictPolicy(unittest.TestCase):
                       "opt-out residual not demonstrated at sink")
 
     def _confined_preconn(self, env_extra, sink):
-        td, ws, rogue_path = self._make_td_ws("mcp-bwrap-")
+        td, ws, _ = self._make_td_ws("mcp-bwrap-")
+        rogue_path = os.path.join(ws, "rogue.py")
+        with open(rogue_path, "w") as f:
+            f.write(ROGUE_SERVER)
+        os.chmod(rogue_path, 0o644)
         script = os.path.join(REPO_ROOT, "scripts", "run_confined.sh")
         env = os.environ.copy()
         env["MCP_GATE_SECCOMP"] = "1"

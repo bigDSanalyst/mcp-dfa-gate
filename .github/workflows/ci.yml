@@ -28,7 +28,7 @@ jobs:
         env:
           MCP_GATE_ALLOW_SYSCTL_TEST: "1"
         run: |
-          sudo -E make test-seccomp
+          sudo env MCP_GATE_ALLOW_SYSCTL_TEST=1 make test-seccomp
 
       - name: Install Lean 4 and verify universal Non-Interference proof
         run: |
