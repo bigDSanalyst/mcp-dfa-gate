@@ -11,15 +11,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile policy, build C++20 sidecar, and run 24 hostile tests
+      - name: Compile policy, build C++20 sidecar, and run 25 hostile tests
         run: |
           make policy
           make build
           make test
 
-      - name: Run live Linux kernel SECCOMP_RET_USER_NOTIF RCE exfiltration test
+      - name: Install bubblewrap for confined-fence tests
         run: |
-          make test-seccomp
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          bwrap --version || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Run live Linux kernel SECCOMP_RET_USER_NOTIF red-team tests
+        env:
+          MCP_GATE_ALLOW_SYSCTL_TEST: "1"
+        run: |
+          sudo env MCP_GATE_ALLOW_SYSCTL_TEST=1 make test-seccomp
 
       - name: Install Lean 4 and verify universal Non-Interference proof
         run: |

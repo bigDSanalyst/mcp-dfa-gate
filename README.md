@@ -31,7 +31,7 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
 make policy        # Compile policies/enterprise_example.json -> C++20 + Lean 4
 make build         # Compile mcp-dfa-gate (-std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread)
 make test          # Run 25 hostile integration tests (tests/test_sidecar.py) -> 25/25
-make test-seccomp  # Run 23 live-kernel red-team tests (tests/test_seccomp.py) -> 23/23
+make test-seccomp  # Run 26 live-kernel red-team tests (tests/test_seccomp.py) -> 26/26
 make verify        # Check Lean 4 universal Non-Interference proof
 ```
 
@@ -72,6 +72,12 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 * **BREAKING -- `bash_workspace` now takes a typed argv array (H4 closed):** `arguments` changed from `{"command": "sha256sum /ws/file.txt"}` to `{"argv": ["sha256sum", "/ws/file.txt"]}`. The shell command-string parser is deleted; the downstream executor contract is direct `execv(3)` on the vetted array (never a shell), so the gate and the executor can no longer disagree about command grammar. Filenames containing spaces or metacharacters are now ordinary data and work end to end.
 * **Error taxonomy split:** malformed `argv` (missing/non-array/empty, non-string/empty/oversized/non-printable elements, >256 elements, or the removed legacy `command` key) returns a clean JSON-RPC `-32602` with an actionable message -- nothing is forwarded and the session survives; well-formed but unvetted content keeps the v0.5 semantics (`-32001` plus permanent session absorption).
 * **Downstream implementers:** exec the forwarded `argv` array directly (`shell=False` / `posix_spawn`-equivalent) and re-check `argv[0]` against the vetted allowlist as defense in depth; run with `cwd` pinned to the workspace (as `scripts/run_confined.sh` does).
+
+## Upgrade Notes (v0.6.0 -> v0.6.1)
+
+* **Strict fence by default (breaking for partial-sweep environments):** Any sweep failure (unreachable FDs, errors, non-convergence) now fails closed (taint stored, tree killed, exit **43**). Set `MCP_GATE_ALLOW_PARTIAL_FENCE=1` to explicitly accept the mediated-denies-only residual (loud startup + fence warnings).
+* **Target-scoped discovery & exact socket identity:** Descendant discovery walks `/proc/<pid>/task/<tid>/children` recursively (falling back to `/proc` ppid-walk only if unavailable); socket deduplication uses exact `(st_dev, st_ino)` pairs; `pidfd_getfd` failures are classified into `vanished`/`eperm`/`other`.
+* **`scripts/run_confined.sh`:** Added optional `MCP_GATE_UNSHARE_NET=1` (`--unshare-net`).
 
 ## Known Residuals
 

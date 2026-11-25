@@ -941,5 +941,332 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
                 proc.wait()
 
 
+class _PersistentSink:
+    """TCP sink that keeps each accepted connection open until EOF so
+    multi-write residual tests capture both PRE_C and POST_C."""
+    def __init__(self):
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self.port = self._srv.getsockname()[1]
+        self._srv.listen(4)
+        self._srv.settimeout(0.2)
+        self._stop = threading.Event()
+        self._chunks = []
+        self._lock = threading.Lock()
+        self._t = threading.Thread(target=self._accept_loop, daemon=True)
+        self._t.start()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._read_conn, args=(conn,), daemon=True).start()
+
+    def _read_conn(self, conn):
+        conn.settimeout(0.5)
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    with self._lock:
+                        self._chunks.append(data)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def received(self):
+        with self._lock:
+            return list(self._chunks)
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self._t.join(timeout=2)
+
+
+class TestFenceStrictPolicy(unittest.TestCase):
+    """v0.6.1 (Issue #5): strict-by-default fence, MCP_GATE_ALLOW_PARTIAL_FENCE=1
+    opt-out residual characterization, and bwrap confined smoke."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        import pwd
+        try:
+            e = pwd.getpwnam("nobody")
+            cls.nobody_uid, cls.nobody_gid = e.pw_uid, e.pw_gid
+        except KeyError:
+            cls.nobody_uid, cls.nobody_gid = None, None
+        cls.yama_path = "/proc/sys/kernel/yama/ptrace_scope"
+        cls.sysctl_opted_in = (os.environ.get("MCP_GATE_ALLOW_SYSCTL_TEST") == "1")
+        cls.can_force = (
+            cls.sysctl_opted_in
+            and os.geteuid() == 0
+            and cls.nobody_uid is not None
+            and os.path.exists(cls.yama_path)
+            and cls._yama_writable()
+        )
+
+    @classmethod
+    def _yama_writable(cls):
+        try:
+            with open(cls.yama_path) as f:
+                old = f.read().strip()
+            with open(cls.yama_path, "w") as f:
+                f.write(old)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    @classmethod
+    def _skip_reason(cls):
+        if not cls.sysctl_opted_in:
+            return ("host-wide yama sysctl mutation disabled by default; "
+                    "set MCP_GATE_ALLOW_SYSCTL_TEST=1 on an isolated VM/CI runner")
+        return ("cannot force PTRACE_MODE_ATTACH_REALCREDS denial: requires root "
+                "and writable kernel.yama.ptrace_scope (euid=%r, nobody=%r)"
+                % (os.geteuid(), cls.nobody_uid))
+
+    @staticmethod
+    def _hard_kill(proc):
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _make_td_ws(self, prefix):
+        td = tempfile.mkdtemp(prefix=prefix)
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        ws = os.path.join(td, "ws")
+        os.makedirs(ws)
+        with open(os.path.join(ws, "readme.txt"), "w") as f:
+            f.write("public\n")
+        with open(os.path.join(ws, "secret.env"), "w") as f:
+            f.write("API_KEY=123\n")
+        rogue_path = os.path.join(td, "rogue.py")
+        with open(rogue_path, "w") as f:
+            f.write(ROGUE_SERVER)
+        os.chmod(td, 0o755)
+        os.chmod(ws, 0o755)
+        os.chmod(os.path.join(ws, "readme.txt"), 0o644)
+        os.chmod(os.path.join(ws, "secret.env"), 0o644)
+        os.chmod(rogue_path, 0o644)
+        return td, ws, rogue_path
+
+    @staticmethod
+    def _direct_children(pid):
+        path = f"/proc/{pid}/task/{pid}/children"
+        try:
+            with open(path) as f:
+                return [int(x) for x in f.read().split() if x.isdigit()]
+        except OSError:
+            return []
+
+    def _run_unreachable_fd_session(self, allow_partial):
+        sink = _PersistentSink()
+        self._last_sink = sink
+        self.addCleanup(sink.close)
+        td, ws, rogue_path = self._make_td_ws("mcp-strict-")
+        gate_copy = os.path.join(td, "gate")
+        shutil.copy2(GATE_BIN, gate_copy)
+        os.chmod(gate_copy, 0o755)
+
+        env = os.environ.copy()
+        env["MCP_GATE_SECCOMP"] = "1"
+        if allow_partial:
+            env["MCP_GATE_ALLOW_PARTIAL_FENCE"] = "1"
+        else:
+            env.pop("MCP_GATE_ALLOW_PARTIAL_FENCE", None)
+
+        argv = [gate_copy, ws + "/", "--", sys.executable, rogue_path,
+                "preconn", str(sink.port)]
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env,
+                                cwd=td, user=self.nobody_uid,
+                                group=self.nobody_gid)
+        self.addCleanup(self._hard_kill, proc)
+        stderr_lines = []
+
+        def drain():
+            for raw in iter(proc.stderr.readline, b""):
+                stderr_lines.append(raw.decode("utf-8", "replace"))
+        threading.Thread(target=drain, daemon=True).start()
+
+        def call(rid, fname):
+            req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                   "params": {"name": "read_file",
+                              "arguments": {"path": os.path.join(ws, fname)}}}
+            try:
+                proc.stdin.write((json.dumps(req) + "\n").encode("ascii"))
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                return None
+            ready, _, _ = select.select([proc.stdout], [], [], 20)
+            if not ready:
+                return None
+            line = proc.stdout.readline()
+            return json.loads(line.decode("ascii")) if line else None
+
+        old_yama = None
+        child_pids = []
+        try:
+            r1 = call(1, "readme.txt")
+            self.assertIsNotNone(r1, "gate timed out on call 1")
+            s1 = r1["result"]["status"]
+            child_pids = self._direct_children(proc.pid)
+            with open(self.yama_path) as f:
+                old_yama = f.read().strip()
+            with open(self.yama_path, "w") as f:
+                f.write("2")
+            r2 = call(2, "secret.env")
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            rc = proc.wait(timeout=30)
+            time.sleep(0.3)
+            return rc, s1, r2, stderr_lines, child_pids
+        finally:
+            if old_yama is not None:
+                try:
+                    with open(self.yama_path, "w") as f:
+                        f.write(old_yama)
+                except OSError:
+                    pass
+
+    def test_strict_fence_unreachable_fd_fails_closed_exit43(self):
+        """Outcome 2: unreachable fd + default strict -> exit 43, descendant
+        killed (ESRCH), and no post-taint canary reaches the sink."""
+        if not self.can_force:
+            self.skipTest(self._skip_reason())
+        rc, s1, r2, err, child_pids = self._run_unreachable_fd_session(False)
+        self.assertEqual(s1, "OK", f"pre-taint call failed: {s1}")
+        self.assertIsNone(r2, "strict fence must terminate before answering call 2")
+        self.assertEqual(rc, 43, f"expected exit 43; stderr tail: {err[-8:]!r}")
+        self.assertTrue(any("FENCE FAILURE (strict)" in l for l in err),
+                        "missing strict fence-failure diagnostic")
+        self.assertNotIn(b"POST_C", b"".join(self._last_sink.received()),
+                         "post-taint exfil reached the sink despite strict fence")
+        for cpid in child_pids:
+            with self.assertRaises(ProcessLookupError,
+                                   msg=f"descendant pid {cpid} survived exit 43"):
+                os.kill(cpid, 0)
+
+    def test_allow_partial_fence_opt_out_residual_characterized(self):
+        """Outcome 3: unreachable fd + MCP_GATE_ALLOW_PARTIAL_FENCE=1 ->
+        loud FENCE WARNING, tree resumed, and surviving socket delivers POST_C."""
+        if not self.can_force:
+            self.skipTest(self._skip_reason())
+        rc, s1, r2, err, _ = self._run_unreachable_fd_session(True)
+        self.assertEqual(s1, "OK", f"pre-taint call failed: {s1}")
+        self.assertEqual(rc, 0, f"opt-out must survive; stderr tail: {err[-8:]!r}")
+        self.assertTrue(any("FENCE WARNING" in l for l in err),
+                        "missing FENCE WARNING under opt-out")
+        self.assertTrue(any("MCP_GATE_ALLOW_PARTIAL_FENCE" in l for l in err),
+                        "missing loud operator-override log")
+        self.assertIsNotNone(r2, "session died before call 2 response")
+        self.assertEqual(r2["result"]["status"], "SENT",
+                         f"expected surviving socket SENT, got {r2['result']['status']!r}")
+        self.assertIn(b"POST_C", b"".join(self._last_sink.received()),
+                      "opt-out residual not demonstrated at sink")
+
+    def _confined_preconn(self, env_extra, sink):
+        td, ws, _ = self._make_td_ws("mcp-bwrap-")
+        rogue_path = os.path.join(ws, "rogue.py")
+        with open(rogue_path, "w") as f:
+            f.write(ROGUE_SERVER)
+        os.chmod(rogue_path, 0o644)
+        script = os.path.join(REPO_ROOT, "scripts", "run_confined.sh")
+        env = os.environ.copy()
+        env["MCP_GATE_SECCOMP"] = "1"
+        env.pop("MCP_GATE_ALLOW_PARTIAL_FENCE", None)
+        env.update(env_extra)
+        argv = ["bash", script, ws + "/", "--", sys.executable,
+                rogue_path, "preconn", str(sink.port)]
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+        self.addCleanup(self._hard_kill, proc)
+        stderr_lines = []
+
+        def drain():
+            for raw in iter(proc.stderr.readline, b""):
+                stderr_lines.append(raw.decode("utf-8", "replace"))
+        threading.Thread(target=drain, daemon=True).start()
+
+        def call(rid, fname):
+            req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                   "params": {"name": "read_file",
+                              "arguments": {"path": os.path.join(ws, fname)}}}
+            try:
+                proc.stdin.write((json.dumps(req) + "\n").encode("ascii"))
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                return None
+            ready, _, _ = select.select([proc.stdout], [], [], 30)
+            if not ready:
+                return None
+            line = proc.stdout.readline()
+            return json.loads(line.decode("ascii")) if line else None
+
+        r1 = call(1, "readme.txt")
+        s1 = r1["result"]["status"] if r1 else None
+        r2 = call(2, "secret.env")
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        rc = proc.wait(timeout=60)
+        time.sleep(0.3)
+        return rc, s1, r2, stderr_lines
+
+    def test_bwrap_confined_fence_and_strict_mode(self):
+        """Confined smoke via scripts/run_confined.sh: post-taint exfil is
+        blocked in both privilege outcomes (severed or strict exit 43)."""
+        if shutil.which("bwrap") is None:
+            self.skipTest("bubblewrap is not installed on this host")
+        probe = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "/bin/true"],
+            capture_output=True, timeout=30)
+        if probe.returncode != 0:
+            self.skipTest("bwrap unusable on this host: %r"
+                          % probe.stderr.decode("utf-8", "replace")[-200:])
+        sink_a = Sink()
+        self.addCleanup(sink_a.close)
+        rc, s1, r2, err = self._confined_preconn({}, sink_a)
+        self.assertEqual(s1, "OK", f"confined pre-taint failed: {s1} :: {err[-8:]!r}")
+        if rc == 43:
+            self.assertTrue(any("FENCE FAILURE (strict)" in l for l in err))
+            self.assertIsNone(r2)
+        else:
+            self.assertEqual(rc, 0, f"unexpected confined exit; {err[-12:]!r}")
+            self.assertIsNotNone(r2)
+            assert_channel_severed(self, r2["result"]["status"],
+                                   "bwrap confined: post-taint write")
+        self.assertNotIn(b"POST_C", b"".join(sink_a.received()),
+                         "post-taint exfil reached sink (confined strict default)")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

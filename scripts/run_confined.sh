@@ -16,6 +16,13 @@ shift
 
 GATE_BIN="${MCP_GATE_BIN:-$(dirname "$0")/../mcp-dfa-gate}"
 
+# Optional network-namespace isolation (not equivalent to FD-sweep
+# verification; does not cover AF_UNIX/socketpair channels).
+NET_ARGS=()
+if [[ "${MCP_GATE_UNSHARE_NET:-0}" == "1" ]]; then
+  NET_ARGS+=(--unshare-net)
+fi
+
 exec "$GATE_BIN" "$SAFE_PREFIX" -- \
   bwrap \
     --ro-bind /usr /usr \
@@ -29,6 +36,7 @@ exec "$GATE_BIN" "$SAFE_PREFIX" -- \
     --dev /dev \
     --chdir "$SAFE_PREFIX" \
     --unshare-pid \
+    "${NET_ARGS[@]}" \
     --die-with-parent \
     --new-session \
     "$@"
