@@ -87,8 +87,7 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 
 See `SECURITY.md` for the full threat model and trust boundaries. Remaining v0.6-line items (H4 de-shell shipped in v0.6.0):
 
-* **Confined (`bwrap`) fence boundary (#5):** The FD sweep is verified in direct sidecar mode only. Under `bwrap --unshare-pid` with an unprivileged user namespace (or `kernel.yama.ptrace_scope >= 2`), `pidfd_getfd` may fail with `EPERM`; the fence emits a loud `FENCE WARNING` and mediated syscalls still deny, but pre-taint sockets may survive (`--unshare-net` mitigates; live bwrap-mode fence testing and a sweep privilege model are tracked for a later v0.6.x release).
-* **Landlock `/proc/<pid>/mem` hardening (#4):** Tracked for a later v0.6.x release (Linux 5.13+).
+* All `v0.6` roadmap items (#3 H4 de-shell, #5 strict-by-default fence & `bwrap` coverage, #4 Landlock `/proc/<pid>/mem` hardening) are shipped; see `SECURITY.md` for remaining out-of-scope deployment boundaries.
 
 ## License
 
