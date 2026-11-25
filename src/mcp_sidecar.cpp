@@ -21,6 +21,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -31,6 +32,11 @@
 #if defined(__linux__) && __has_include(<linux/openat2.h>)
 #include <linux/openat2.h>
 #define MCP_GATE_HAVE_OPENAT2_H 1
+#endif
+
+// Linux 3.4+; some glibc versions do not define it in <sys/prctl.h>.
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
 #endif
 
 namespace {
@@ -1002,6 +1008,24 @@ int main(int argc, char** argv) {
   std::atomic<bool> shared_halted{false};
   mcp_seccomp::Supervisor supervisor;
 
+  // v0.5.1: become a child subreaper BEFORE the spawn. The bit is inherited,
+  // so the downstream root (and every descendant) is a subreaper too:
+  // orphaned double-forked descendants reparent to the nearest live subreaper
+  // INSIDE the tree instead of escaping to init, and anything orphaned above
+  // a dead root lands on the sidecar itself. The fence's /proc ppid-walk
+  // (root-anchored, plus the sidecar's own children) then sees every
+  // fd-holding descendant. Fail closed: without it, daemonized children
+  // would be invisible to the quarantine fence.
+  if (enable_seccomp &&
+      ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] prctl(PR_SET_CHILD_SUBREAPER) failed: %s "
+                 "(fence descendant discovery requires it); refusing to start\n",
+                 std::strerror(errno));
+    ::close(ws_fd);
+    return 3;
+  }
+
   Child child;
   if (!spawn_downstream(downstream, child, enable_seccomp)) {
     std::fprintf(stderr, "[mcp-dfa-gate] failed to spawn downstream server (seccomp=%d)\n",
@@ -1110,24 +1134,38 @@ int main(int argc, char** argv) {
       const auto r = engine.inspect_tool(effective_tool, is_sensitive);
       const auto st_after = engine.state();
 
-      // v0.5 quarantine fence: when this call raises uncleared taint (or halts
-      // the lattice) while the downstream tree may still hold live sockets,
-      // sever every socket object BEFORE the new taint becomes visible to the
-      // supervisor verdict loop. fence() is serialized against all verdicts,
-      // so no CONTINUE can be issued after the raise; write-family syscalls on
-      // severed sockets then fail with EPIPE without per-write mediation.
-      if (enable_seccomp) {
-        const std::uint64_t new_uncleared =
-            (st_after.taint & ~combined_clearance) & ~(st_before.taint & ~combined_clearance);
-        const bool raised =
-            (new_uncleared != 0ULL) || (st_after.halted && !st_before.halted);
-        if (raised) {
-          supervisor.fence(st_after.taint, st_after.halted);
+      // v0.5 quarantine fence: when this call raises uncleared taint (or
+      // halts the lattice) while the downstream tree may still hold live
+      // sockets, sever every socket object BEFORE the new taint becomes
+      // visible to the supervisor verdict loop. fence() is serialized
+      // against all verdicts, so no CONTINUE can be issued after the raise;
+      // write-family syscalls on severed sockets then fail with EPIPE
+      // without per-write mediation.
+      //
+      // v0.5.1: the fence is the SOLE owner of the raise transition (it
+      // stops, severs, and stores as one linearized unit); the sidecar
+      // stores only benign transitions below. A false return means
+      // descendant quiescence was unverifiable: terminate the downstream
+      // tree and fail closed (exit 43) -- resuming an unverified process
+      // would violate the linearization contract.
+      const std::uint64_t new_uncleared =
+          (st_after.taint & ~combined_clearance) &
+          ~(st_before.taint & ~combined_clearance);
+      const bool raised = enable_seccomp &&
+                          ((new_uncleared != 0ULL) ||
+                           (st_after.halted && !st_before.halted));
+      if (raised) {
+        if (!supervisor.fence(st_after.taint, st_after.halted)) {
+          std::fprintf(stderr,
+                       "[mcp-dfa-gate] FENCE FAILURE: terminating downstream "
+                       "tree and exiting 43 (linearization unverified)\n");
+          supervisor.kill_tree();
+          ::_exit(43);
         }
+      } else {
+        shared_taint.store(st_after.taint, std::memory_order_release);
+        shared_halted.store(st_after.halted, std::memory_order_release);
       }
-
-      shared_taint.store(st_after.taint, std::memory_order_release);
-      shared_halted.store(st_after.halted, std::memory_order_release);
 
       std::fprintf(stderr,
                    "[mcp-dfa-gate] seq=%lu tool=\"%s\" taint=0x%016llx allowed=%d\n",

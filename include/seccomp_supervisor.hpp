@@ -32,6 +32,28 @@
 //    loud FENCE WARNING: severance is not guaranteed in that mode; mediated
 //    denies still hold.
 //
+// v0.5.1 fence correctness (external review disposition):
+//  * Descendant discovery: at fence time the supervisor snapshots /proc and
+//    follows ppid links from the downstream root (plus anything reparented
+//    to the sidecar -- PR_SET_CHILD_SUBREAPER, set by the sidecar before the
+//    spawn and inherited by the root, keeps orphaned double-forked
+//    descendants inside the tree instead of escaping to init). Every
+//    descendant is registered and SIGSTOPped before the sweep, so a silent
+//    child that inherited a socket without ever calling a mediated syscall
+//    can no longer escape the fence (v0.5.0 gap).
+//  * Fail-closed quiescence: if any tracked thread group cannot be
+//    VERIFIABLY stopped after bounded retries, the fence stores the taint
+//    (mediated denies still hold), leaves the tree SIGSTOPped, and returns
+//    false; the sidecar then terminates the session (exit 43). /proc read
+//    errors count as unverified, never as success.
+//  * Honest sweep accounting: shutdown() results are recorded and
+//    classified by socket object identity (severed-new / already-severed /
+//    inert ENOTCONN / unreachable / error); a quiesced pass is one that
+//    severs nothing new with zero unreachables and zero errors.
+//  * RECV under the verdict mutex (poll(0)-guarded): the supervisor's RECV
+//    can no longer race the fence's drain, and the 5.10 blocking-RECV on an
+//    empty queue cannot fire on any path.
+//
 // Linearization contract: a byte leaves the host only if its write syscall was
 // completed (queued to the socket buffer) before the fence's shutdown() of that
 // socket object; any write issued after the fence resumes fails with EPIPE.
@@ -46,7 +68,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -249,11 +273,20 @@ class Supervisor {
       std::lock_guard<std::mutex> lk(verdict_mutex_);
       register_pid_locked(root_pid);  // best effort; dead pid is harmless
     }
+    root_pid_ = root_pid;
     stop_flag_.store(false, std::memory_order_relaxed);
-    started_ = true;
-    thread_ = std::thread([this, taint_mask, halted, net_clearance_mask, exec_clearance_mask]() {
-      run_loop(taint_mask, halted, net_clearance_mask, exec_clearance_mask);
-    });
+    try {
+      thread_ = std::thread([this, taint_mask, halted, net_clearance_mask, exec_clearance_mask]() {
+        run_loop(taint_mask, halted, net_clearance_mask, exec_clearance_mask);
+      });
+    } catch (...) {
+      // v0.5.1: never appear started without a running supervisor thread.
+      std::fprintf(stderr, "[mcp-dfa-gate] supervisor thread creation failed\n");
+      ::close(listener_fd_);
+      listener_fd_ = -1;
+      return false;
+    }
+    started_.store(true, std::memory_order_release);
     return true;
   }
 
@@ -261,28 +294,55 @@ class Supervisor {
   // Serialized against verdicts by verdict_mutex_. Idempotent; call on every
   // raise (new uncleared taint bits or a fresh halt).
   //
-  // Phase 1 (freeze): SIGSTOP tracked thread groups, then drain every pending
-  //   notif with -EPERM. A drained syscall has NOT executed (it was blocked in
-  //   USER_NOTIF), so draining guarantees no mediated socket creation can begin
-  //   after this point; a CONTINUE issued before the fence has either finished
-  //   (fd installed, enumerable) or the creating thread is still inside it --
-  //   covered by the quiescing sweep.
-  // Phase 2 (quiesce+sweep): repeatedly sweep every tracked fd table, shutting
-  //   down every socket object, until a full pass severs nothing new. This
-  //   closes the race where a CONTINUE'd socket/accept installs its fd between
-  //   readdir() calls of a single pass (shutting the listener also aborts
-  //   blocked accepts with EINVAL, so the sweep converges).
-  // Phase 3 (linearize+resume): store the new mask, SIGCONT.
-  void fence(std::uint64_t new_taint, bool new_halted) {
-    if (!started_.load(std::memory_order_acquire)) return;
+  // Returns false on FENCE FAILURE: quiescence of some fd-holding descendant
+  // could not be VERIFIED, so the stop -> sever -> store -> resume
+  // linearization contract cannot be honored. On failure the new taint is
+  // still stored (every mediated syscall denies for every remaining
+  // process) and the tree is left SIGSTOPped -- never resumed unverified.
+  // The sidecar owns the policy and terminates the session.
+  //
+  // Phase 0 (discover+freeze fixpoint): snapshot /proc, walk ppid links from
+  //   the downstream root and from the sidecar's own children (the sidecar
+  //   is a child subreaper, so orphaned double-forked descendants reparent
+  //   inside the tree instead of escaping to init), soft-register and SIGSTOP
+  //   every descendant not yet tracked, drain pending notifs, and repeat
+  //   until a round registers nobody new. Stopped processes cannot fork, so
+  //   the fixpoint proves no fd-holding descendant is left running.
+  // Phase 1 (quiescence confirmation): every tracked thread group must be
+  //   verifiably stopped or gone (/proc read errors count as NOT stopped).
+  //   Otherwise the fence fails closed.
+  // Phase 2 (quiescing sweep): repeatedly sweep every tracked fd table,
+  //   classifying shutdown() outcomes by socket object identity, until a
+  //   full pass severs nothing new with zero unreachable fds and zero
+  //   errors. Unreachable fds (userns/ptrace boundary) are a loud FENCE
+  //   WARNING: severance not guaranteed there, mediated denies unaffected.
+  // Phase 3 (linearize+resume): store the new mask (the linearization
+  //   point), SIGCONT, report.
+  bool fence(std::uint64_t new_taint, bool new_halted) {
+    if (!started_.load(std::memory_order_acquire)) return true;
     std::lock_guard<std::mutex> lk(verdict_mutex_);
     const auto t0 = std::chrono::steady_clock::now();
 
-    // Phase 1: freeze + drain pending verdicts.
-    for (const auto& kv : pidfds_) {
-      send_signal(kv.first, kv.second, SIGSTOP);
-    }
+    // Phase 0: discover + freeze to a fixpoint. A process forked by a
+    // not-yet-stopped descendant after a scan is caught by the next round;
+    // when a full round registers nobody new, every descendant is stopped
+    // and no new one can appear.
+    bool overflow = false;
+    bool discovery_converged = false;
+    int rounds = 0;
     int drained = 0;
+    for (int round = 0; round < 8; ++round) {
+      ++rounds;
+      const int fresh = discover_and_freeze_locked(&overflow);
+      drained += drain_pending_eperm();
+      if (overflow) break;  // tracking cap exceeded: coverage impossible
+      if (fresh == 0) {
+        discovery_converged = true;
+        break;
+      }
+    }
+
+    // Phase 1: confirm every tracked thread group is verifiably stopped.
     bool all_stopped = false;
     for (int iter = 0; iter < 24 && !all_stopped; ++iter) {
       drained += drain_pending_eperm();
@@ -296,37 +356,76 @@ class Supervisor {
       if (!all_stopped) ::usleep(5 * 1000);
     }
 
-    // Phase 2: quiescing sweep.
+    if (!all_stopped || overflow || !discovery_converged) {
+      // FENCE FAILURE: fail closed. Resuming a process whose stop could not
+      // be verified would violate the linearization contract (it may hold a
+      // pre-existing socket and write to it during or after the sweep).
+      taint_mask_->store(new_taint, std::memory_order_release);
+      halted_->store(new_halted, std::memory_order_release);
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] FENCE FAILURE: descendant quiescence "
+                   "unverified (stopped=%d converged=%d cap=%d); taint "
+                   "stored, tree left stopped, terminating session\n",
+                   all_stopped ? 1 : 0, discovery_converged ? 1 : 0,
+                   overflow ? 1 : 0);
+      return false;
+    }
+
+    // Phase 2: quiescing sweep with honest accounting. Every tracked task is
+    // verified stopped, so fd tables are frozen: a pass that severs nothing
+    // new, reaches every fd, and records no errors proves the tables hold no
+    // live socket object.
+    std::unordered_set<std::uint64_t> severed_objects;
     int scanned = 0;
     int severed = 0;
-    int passes = 0;
+    int already_severed = 0;
+    int inert = 0;
     int unreachable_high_water = 0;
+    int sweep_errors = 0;
+    bool sweep_converged = false;
+    int passes = 0;
     for (int pass = 0; pass < 4; ++pass) {
       ++passes;
-      int pass_severed = 0;
+      int pass_new = 0;
       int pass_unreachable = 0;
+      int pass_errors = 0;
       for (const auto& kv : pidfds_) {
-        const SweepResult r = sweep_sockets(kv.first, kv.second);
+        const SweepResult r =
+            sweep_sockets(kv.first, kv.second, severed_objects);
         scanned += r.duplicated;
-        pass_severed += r.severed;
+        pass_new += r.severed_new;
+        already_severed += r.already_severed;
+        inert += r.inert;
         pass_unreachable += r.unreachable;
+        pass_errors += r.errors;
       }
-      severed += pass_severed;
+      severed += pass_new;
       if (pass_unreachable > unreachable_high_water) {
         unreachable_high_water = pass_unreachable;
       }
-      if (pass_severed == 0) break;  // fd tables quiesced: nothing new appeared
+      sweep_errors += pass_errors;
+      if (pass_new == 0 && pass_unreachable == 0 && pass_errors == 0) {
+        sweep_converged = true;  // fd tables quiesced: nothing new appeared
+        break;
+      }
     }
     if (unreachable_high_water > 0) {
-      // The sweep could not duplicate every fd. PR_SET_DUMPABLE(0) is denied
-      // by the filter, but a user-namespace boundary (bwrap --unshare-pid) or
-      // a credential change can still deny pidfd_getfd. Severance is NOT
-      // guaranteed in this mode; every mediated syscall still denies.
+      // The sweep could not duplicate every fd (user-namespace or ptrace
+      // boundary, e.g. bwrap --unshare-pid, or a credential change).
+      // Severance is NOT guaranteed in this mode; mediated denies still hold.
       std::fprintf(stderr,
                    "[mcp-dfa-gate] FENCE WARNING: %d fd(s) unreachable for "
                    "pidfd_getfd; socket severance NOT guaranteed (userns or "
                    "ptrace boundary) -- mediated denies still active\n",
                    unreachable_high_water);
+    }
+    if (sweep_errors > 0 || !sweep_converged) {
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] FENCE WARNING: sweep %s (errors=%d "
+                   "passes=%d); severance accounting may be incomplete -- "
+                   "mediated denies still active\n",
+                   sweep_converged ? "reported errors" : "did not converge",
+                   sweep_errors, passes);
     }
 
     // Phase 3: linearization point.
@@ -341,11 +440,24 @@ class Supervisor {
                         std::chrono::steady_clock::now() - t0)
                         .count();
     std::fprintf(stderr,
-                 "[mcp-dfa-gate] FENCE pids=%zu drained=%d passes=%d fds=%d "
-                 "sockets_severed=%d taint=0x%016llx halted=%d (%lldms)\n",
-                 pidfds_.size(), drained, passes, scanned, severed,
-                 static_cast<unsigned long long>(new_taint), new_halted ? 1 : 0,
-                 static_cast<long long>(ms));
+                 "[mcp-dfa-gate] FENCE pids=%zu rounds=%d drained=%d "
+                 "passes=%d fds=%d severed=%d already=%d inert=%d "
+                 "(taint=0x%016llx halted=%d %lldms)\n",
+                 pidfds_.size(), rounds, drained, passes, scanned, severed,
+                 already_severed, inert,
+                 static_cast<unsigned long long>(new_taint),
+                 new_halted ? 1 : 0, static_cast<long long>(ms));
+    return true;
+  }
+
+  // FENCE FAILURE path: best-effort SIGKILL of every tracked process. The
+  // sidecar calls this and exits immediately after fence() returns false.
+  void kill_tree() noexcept {
+    if (!started_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(verdict_mutex_);
+    for (const auto& kv : pidfds_) {
+      send_signal(kv.first, kv.second, SIGKILL);
+    }
   }
 
   // Respond -EPERM to every notif currently queued on the listener. Each
@@ -376,12 +488,16 @@ class Supervisor {
     return drained;
   }
 
-  // True when every live task of the thread group is stopped ('T'/'t') or gone.
+  // True when every live task of the thread group is stopped ('T'/'t'),
+  // dead ('Z'/'X'), or gone. Unreadable state is NOT quiesced: the caller
+  // must treat it as unverified (fail closed).
   static bool tgid_quiesced(pid_t tgid) noexcept {
     char dir[48];
     std::snprintf(dir, sizeof dir, "/proc/%d/task", static_cast<int>(tgid));
     DIR* d = ::opendir(dir);
-    if (d == nullptr) return true;  // gone
+    if (d == nullptr) {
+      return errno == ENOENT;  // gone = quiesced; unreadable = unverified
+    }
     bool quiesced = true;
     struct dirent* e;
     while ((e = ::readdir(d)) != nullptr) {
@@ -415,19 +531,29 @@ class Supervisor {
   }
 
  private:
-  static void send_signal(pid_t pid, int pidfd, int sig) noexcept {
+  // True when the signal was delivered (or the target is already gone, which
+  // cannot interfere with the fence). False = undeliverable: the caller's
+  // stop/quiesce verification must treat the target as unverified.
+  static bool send_signal(pid_t pid, int pidfd, int sig) noexcept {
 #if defined(SYS_pidfd_send_signal)
-    if (::syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, 0U) == 0) return;
-    if (errno == ESRCH) return;
+    if (pidfd >= 0) {
+      if (::syscall(SYS_pidfd_send_signal, pidfd, sig, nullptr, 0U) == 0) {
+        return true;
+      }
+      if (errno == ESRCH) return true;  // gone: cannot interfere
+    }
 #endif
-    ::kill(pid, sig);  // fallback for kernels without pidfd_send_signal
+    if (::kill(pid, sig) == 0) return true;
+    return errno == ESRCH;  // gone: cannot interfere
   }
 
   static bool proc_state_stopped(pid_t tid) noexcept {
     char path[64];
     std::snprintf(path, sizeof path, "/proc/%d/stat", static_cast<int>(tid));
     FILE* f = std::fopen(path, "r");
-    if (f == nullptr) return true;  // gone: cannot interfere
+    if (f == nullptr) {
+      return errno == ENOENT;  // gone; unreadable = unverified, NOT stopped
+    }
     char buf[512];
     const char* got = std::fgets(buf, sizeof buf, f);
     std::fclose(f);
@@ -436,23 +562,44 @@ class Supervisor {
     if (rp == nullptr) return true;
     ++rp;
     while (*rp == ' ') ++rp;
-    return (*rp == 'T' || *rp == 't');
+    // 'T'/'t' = stopped. 'Z' (zombie) / 'X' (dead) hold no fds and cannot
+    // interfere; anything else (R, S, D, ...) is not verified-stopped.
+    return (*rp == 'T' || *rp == 't' || *rp == 'Z' || *rp == 'X');
   }
 
-  // Sweep outcome for one tracked thread group. `unreachable` counts fds
-  // the sweep could not duplicate for reasons other than EBADF (fd churn
-  // while the table is not yet quiesced): e.g. EPERM when the target sits
-  // across a user-namespace boundary (bwrap --unshare-pid) or is otherwise
-  // not ptrace-accessible. Severance is not guaranteed for those fds; the
-  // fence reports the condition loudly instead of failing silently.
+  // Sweep outcome for one tracked thread group (one pass):
+  //  severed_new:     shutdown() == 0 on a socket object not seen severed
+  //                   before in this fence (object identity via (dev,ino)).
+  //  already_severed: shutdown() == 0 on an object severed in an earlier
+  //                   pass (idempotent re-sweep of a frozen table).
+  //  inert:           shutdown() == ENOTCONN: an unconnected socket cannot
+  //                   transmit -- transmission requires connect()/sendto(),
+  //                   both mediated -- so it is left alone deliberately.
+  //  unreachable:     the fd exists but pidfd_getfd could not duplicate it
+  //                   (EPERM-class: user-namespace / ptrace boundary), or
+  //                   the fd table itself is unenumerable.
+  //  errors:          shutdown() failed for an unexpected reason.
   struct SweepResult {
     int duplicated;
-    int severed;
+    int severed_new;
+    int already_severed;
+    int inert;
     int unreachable;
+    int errors;
   };
 
-  static SweepResult sweep_sockets(pid_t pid, int pidfd) noexcept {
-    SweepResult r{0, 0, 0};
+  // Stable identity of the underlying kernel object (socket inode); two
+  // aliased fds (dup2/fork/SCM_RIGHTS) map to the same key, so a re-swept
+  // object is classified "already severed" instead of double-counted.
+  static std::uint64_t object_key(const struct stat& st) noexcept {
+    return (static_cast<std::uint64_t>(st.st_dev) * 0x9E3779B97F4A7C15ULL) ^
+           static_cast<std::uint64_t>(st.st_ino);
+  }
+
+  static SweepResult sweep_sockets(
+      pid_t pid, int pidfd,
+      std::unordered_set<std::uint64_t>& severed) noexcept {
+    SweepResult r{0, 0, 0, 0, 0, 0};
     char dir[64];
     std::snprintf(dir, sizeof dir, "/proc/%d/fd", static_cast<int>(pid));
     DIR* d = ::opendir(dir);
@@ -466,20 +613,33 @@ class Supervisor {
     while ((e = ::readdir(d)) != nullptr) {
       if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
       const int fdnum = std::atoi(e->d_name);
+      if (pidfd < 0) {
+        ++r.unreachable;  // no pidfd: cannot duplicate anything (warn class)
+        continue;
+      }
       const long dup = ::syscall(SYS_pidfd_getfd, pidfd, fdnum, 0U);
       if (dup < 0) {
-        // EBADF: fd vanished between readdir() and getfd() (churn on a
-        // not-yet-quiesced table; the next pass re-enumerates). Anything
-        // else (EPERM-class) means the fd exists but we cannot reach it.
-        if (errno != EBADF) ++r.unreachable;
+        // The table is frozen (every task verified stopped), so EBADF
+        // churn should not occur; any failure here is the EPERM-class
+        // unreachable path (or a raced exit, which is inert).
+        ++r.unreachable;
         continue;
       }
       ++r.duplicated;
       struct stat st {};
       if (::fstat(static_cast<int>(dup), &st) == 0 && S_ISSOCK(st.st_mode)) {
         // Object-level kill: every alias in every process sees EPIPE/EOF.
-        ::shutdown(static_cast<int>(dup), SHUT_RDWR);
-        ++r.severed;
+        if (::shutdown(static_cast<int>(dup), SHUT_RDWR) == 0) {
+          if (severed.insert(object_key(st)).second) {
+            ++r.severed_new;
+          } else {
+            ++r.already_severed;
+          }
+        } else if (errno == ENOTCONN) {
+          ++r.inert;
+        } else {
+          ++r.errors;
+        }
       }
       ::close(static_cast<int>(dup));
     }
@@ -512,6 +672,117 @@ class Supervisor {
     return tgid;
   }
 
+  // One discover+freeze round: snapshot /proc, compute the descendant
+  // closure of the downstream root plus anything reparented to the sidecar
+  // itself (PR_SET_CHILD_SUBREAPER keeps orphans there), soft-register
+  // members not yet tracked, and SIGSTOP every tracked process. Returns how
+  // many pids were newly registered; sets *overflow when the tracking cap
+  // would be exceeded (coverage can no longer be guaranteed).
+  int discover_and_freeze_locked(bool* overflow) {
+    std::unordered_map<pid_t, pid_t> ppid_of;
+    if (!scan_proc_ppids(ppid_of)) {
+      // /proc unreadable: discovery degrades to the tracked set. The stop
+      // still runs; quiesce/sweep will surface the degradation loudly
+      // (unreadable == unverified there).
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] FENCE WARNING: /proc scan failed "
+                   "(errno=%d); descendant discovery degraded to the "
+                   "tracked set\n",
+                   errno);
+      for (const auto& kv : pidfds_) {
+        (void)send_signal(kv.first, kv.second, SIGSTOP);
+      }
+      return 0;
+    }
+    std::unordered_map<pid_t, std::vector<pid_t>> kids;
+    for (const auto& kv : ppid_of) kids[kv.second].push_back(kv.first);
+    const pid_t me = ::getpid();
+    std::vector<pid_t> stack;
+    std::unordered_set<pid_t> closure;
+    if (root_pid_ > 0 && ppid_of.count(root_pid_) != 0) {
+      closure.insert(root_pid_);
+      stack.push_back(root_pid_);
+    }
+    // Orphans the subreaper pulled up to the sidecar itself (dead root, or
+    // a daemon promoted past a dead intermediate chain).
+    for (const pid_t c : kids[me]) {
+      if (c != me && closure.insert(c).second) stack.push_back(c);
+    }
+    while (!stack.empty()) {
+      const pid_t p = stack.back();
+      stack.pop_back();
+      for (const pid_t c : kids[p]) {
+        if (closure.insert(c).second) stack.push_back(c);
+      }
+    }
+    closure.erase(me);  // never stop or sweep ourselves
+    int fresh = 0;
+    for (const pid_t p : closure) {
+      if (pidfds_.find(p) != pidfds_.end()) continue;
+      if (pidfds_.size() >= kMaxTrackedPids) {
+        *overflow = true;
+        break;
+      }
+      // Soft register: on pidfd_open failure (EPERM across a user
+      // namespace) the process is still stoppable via kill() and verifiable
+      // via /proc; only the fd sweep cannot reach it (FENCE WARNING class).
+      const long fd = ::syscall(SYS_pidfd_open, p, 0U);
+      if (fd < 0 && errno != ESRCH) {
+        std::fprintf(stderr,
+                     "[mcp-dfa-gate] FENCE WARNING: pidfd_open(pid=%d) "
+                     "failed errno=%d; sweep cannot reach this fd table\n",
+                     static_cast<int>(p), errno);
+      }
+      pidfds_.emplace(p, fd >= 0 ? static_cast<int>(fd) : -1);
+      ++fresh;
+    }
+    for (const auto& kv : pidfds_) {
+      (void)send_signal(kv.first, kv.second, SIGSTOP);
+    }
+    return fresh;
+  }
+
+  // Snapshot every process (thread-group leader) on the system into
+  // out[pid] = ppid. Top-level /proc/<pid> entries are leaders, so one
+  // status read per process yields both fields.
+  static bool scan_proc_ppids(std::unordered_map<pid_t, pid_t>& out) noexcept {
+    DIR* d = ::opendir("/proc");
+    if (d == nullptr) return false;
+    struct dirent* e;
+    while ((e = ::readdir(d)) != nullptr) {
+      if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+      const pid_t pid = static_cast<pid_t>(std::atoi(e->d_name));
+      if (pid <= 0) continue;
+      pid_t tgid = -1;
+      pid_t ppid = -1;
+      if (read_tgid_ppid(pid, &tgid, &ppid) && tgid == pid && ppid >= 0) {
+        out.emplace(pid, ppid);
+      }
+    }
+    ::closedir(d);
+    return true;
+  }
+
+  static bool read_tgid_ppid(pid_t pid, pid_t* tgid, pid_t* ppid) noexcept {
+    char path[48];
+    std::snprintf(path, sizeof path, "/proc/%d/status", static_cast<int>(pid));
+    FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return false;
+    char buf[256];
+    *tgid = -1;
+    *ppid = -1;
+    while (std::fgets(buf, sizeof buf, f) != nullptr) {
+      if (std::strncmp(buf, "Tgid:", 5) == 0) {
+        *tgid = static_cast<pid_t>(std::atoi(buf + 5));
+      } else if (std::strncmp(buf, "PPid:", 5) == 0) {
+        *ppid = static_cast<pid_t>(std::atoi(buf + 5));
+      }
+      if (*tgid > 0 && *ppid >= 0) break;
+    }
+    std::fclose(f);
+    return *tgid > 0 && *ppid >= 0;
+  }
+
   // Returns true when the thread group is tracked (or provably irrelevant).
   // False means "cannot guarantee tracking" and the caller must fail closed
   // with -EPERM.
@@ -541,19 +812,27 @@ class Supervisor {
       struct pollfd pfd {};
       pfd.fd = listener_fd_;
       pfd.events = POLLIN;
-      const int prc = ::poll(&pfd, 1, 50);
+      const int prc = ::poll(&pfd, 1, 50);  // idle wait OUTSIDE the mutex
       if (prc <= 0) continue;
       if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
 
+      // Verdict critical section (v0.5.1: RECV included): mutually exclusive
+      // with fence(), so a fence drain can never race our RECV, and no
+      // CONTINUE can be issued after the fence's taint store. The poll(0)
+      // re-check under the mutex proves the queue is non-empty when we
+      // RECV -- kernels that ignore O_NONBLOCK on NOTIF_RECV (e.g. 5.10)
+      // cannot block us here, and the fence is never starved by an idle
+      // supervisor thread.
+      std::lock_guard<std::mutex> lk(verdict_mutex_);
+      struct pollfd pfd2 {};
+      pfd2.fd = listener_fd_;
+      pfd2.events = POLLIN;
+      if (::poll(&pfd2, 1, 0) <= 0) continue;  // a fence drained it
       struct seccomp_notif req {};
       if (::ioctl(listener_fd_, SECCOMP_IOCTL_NOTIF_RECV, &req) != 0) {
         if (errno == EINTR || errno == ENOENT || errno == EAGAIN) continue;
         break;
       }
-
-      // Verdict critical section: mutually exclusive with fence(). A CONTINUE
-      // can never be issued after the fence's taint store.
-      std::lock_guard<std::mutex> lk(verdict_mutex_);
       const bool tracked = register_pid_locked(req.pid);
 
       const int nr = req.data.nr;
@@ -596,6 +875,7 @@ class Supervisor {
   static constexpr std::size_t kMaxTrackedPids = 1024;
 
   int listener_fd_{-1};
+  pid_t root_pid_{-1};
   std::atomic<std::uint64_t>* taint_mask_{nullptr};
   std::atomic<bool>* halted_{nullptr};
   std::atomic<bool> stop_flag_{false};
@@ -614,7 +894,8 @@ class Supervisor {
              std::uint64_t, std::uint64_t, pid_t) {
     return false;
   }
-  void fence(std::uint64_t, bool) {}
+  bool fence(std::uint64_t, bool) { return true; }
+  void kill_tree() noexcept {}
   void stop() {}
 };
 #endif
