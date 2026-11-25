@@ -314,6 +314,12 @@ def probe(msg):
             return "PROCMEM_OK"
         except OSError as e:
             return "EPERM:%d" % (e.errno or 0)
+    if MODE == "selfread":
+        try:
+            with open(EXTRA, "rb") as _f:
+                return "READ_OK" if _f.read(1) else "READ_EMPTY"
+        except OSError as e:
+            return "EPERM:%d" % (e.errno or 0)
     if MODE == "fork":
         return _fork_probe("fork")
     if MODE == "daemon":
@@ -1289,7 +1295,13 @@ class TestLandlockHardening(unittest.TestCase):
                          ctypes.c_size_t(0), ctypes.c_uint32(1))
         return r >= 1
 
-    def _run_procmem(self, env_extra):
+    def _require_landlock(self):
+        if not self._landlock_supported():
+            if os.environ.get("CI") == "true":
+                self.fail("Landlock LSM unavailable on CI runner -- coverage gap, not a skip")
+            self.skipTest("Landlock LSM not supported/enabled on this kernel")
+
+    def _run_landlock(self, env_extra, mode="procmem", extra_in_ws=None):
         td = tempfile.mkdtemp(prefix="mcp-ll-")
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         ws = os.path.join(td, "ws")
@@ -1303,8 +1315,9 @@ class TestLandlockHardening(unittest.TestCase):
             f.write(ROGUE_SERVER)
         env = os.environ.copy()
         env.update(env_extra)
+        extra_arg = os.path.join(ws, extra_in_ws) if extra_in_ws else "0"
         proc = subprocess.Popen(
-            [GATE_BIN, ws + "/", "--", sys.executable, rogue_path, "procmem", "0"],
+            [GATE_BIN, ws + "/", "--", sys.executable, rogue_path, mode, extra_arg],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env)
         self.addCleanup(TestFenceStrictPolicy._hard_kill, proc)
@@ -1334,28 +1347,35 @@ class TestLandlockHardening(unittest.TestCase):
         return rc, r1["result"]["status"], r2["result"]["status"], stderr_lines
 
     def test_landlock_blocks_proc_self_mem(self):
-        """MCP_GATE_LANDLOCK=1 blocks /proc/self/mem with EACCES while
-        allowing normal workspace reads."""
-        if not self._landlock_supported():
-            self.skipTest("Landlock LSM not supported/enabled on this kernel")
-        rc, s1, s2, err = self._run_procmem({"MCP_GATE_LANDLOCK": "1"})
+        """MCP_GATE_LANDLOCK=1 blocks /proc/self/mem with EACCES."""
+        self._require_landlock()
+        rc, s1, s2, err = self._run_landlock({"MCP_GATE_LANDLOCK": "1"})
         self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
         self.assertEqual(s1, f"EPERM:{errno.EACCES}")
         self.assertEqual(s2, f"EPERM:{errno.EACCES}")
         self.assertTrue(any("LANDLOCK ACTIVE" in l for l in err))
 
+    def test_landlock_allows_workspace_read(self):
+        """Positive control: allowlisted workspace remains readable under
+        MCP_GATE_LANDLOCK=1 (guards against a deny-everything ruleset bug)."""
+        self._require_landlock()
+        rc, s1, s2, err = self._run_landlock(
+            {"MCP_GATE_LANDLOCK": "1"}, mode="selfread", extra_in_ws="readme.txt")
+        self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
+        self.assertEqual(s1, "READ_OK")
+        self.assertEqual(s2, "READ_OK")
+        self.assertTrue(any("LANDLOCK ACTIVE" in l for l in err))
+
     def test_landlock_combined_with_seccomp(self):
         """MCP_GATE_LANDLOCK=1 composes cleanly with MCP_GATE_SECCOMP=1."""
-        if not self._landlock_supported():
-            self.skipTest("Landlock LSM not supported/enabled on this kernel")
-        rc, s1, s2, err = self._run_procmem(
+        self._require_landlock()
+        rc, s1, s2, err = self._run_landlock(
             {"MCP_GATE_LANDLOCK": "1", "MCP_GATE_SECCOMP": "1"})
         self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
         self.assertEqual(s1, f"EPERM:{errno.EACCES}")
         self.assertEqual(s2, f"EPERM:{errno.EACCES}")
         self.assertTrue(any("LANDLOCK ACTIVE" in l for l in err))
         self.assertTrue(any("SECCOMP_UNOTIFY ACTIVE" in l for l in err))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

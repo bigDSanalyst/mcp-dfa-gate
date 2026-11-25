@@ -31,7 +31,7 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
 make policy        # Compile policies/enterprise_example.json -> C++20 + Lean 4
 make build         # Compile mcp-dfa-gate (-std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread)
 make test          # Run 25 hostile integration tests (tests/test_sidecar.py) -> 25/25
-make test-seccomp  # Run 28 live-kernel red-team tests (tests/test_seccomp.py) -> 28/28
+make test-seccomp  # Run 29 live-kernel red-team tests (tests/test_seccomp.py) -> 29/29
 make verify        # Check Lean 4 universal Non-Interference proof
 ```
 
@@ -85,7 +85,7 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 
 ## Known Residuals
 
-See `SECURITY.md` for the full threat model and trust boundaries. Remaining v0.6-line items (H4 de-shell shipped in v0.6.0):
+See `SECURITY.md` for the full threat model and trust boundaries:
 
 * All `v0.6` roadmap items (#3 H4 de-shell, #5 strict-by-default fence & `bwrap` coverage, #4 Landlock `/proc/<pid>/mem` hardening) are shipped; see `SECURITY.md` for remaining out-of-scope deployment boundaries.
 

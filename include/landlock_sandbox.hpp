@@ -9,10 +9,9 @@
 // startup if the kernel does not support Landlock.
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <string>
-#include <string_view>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -87,8 +86,9 @@ inline bool add_path_rule(int ruleset_fd, const char* path,
 }
 
 // Called in the forked downstream child right before execvp().
-// Returns false on any error (caller must _exit(126) fail-closed).
-inline bool child_apply_landlock(std::string_view safe_prefix) noexcept {
+// Async-signal-safe (zero heap allocation). Returns false on any error
+// (caller must _exit(126) fail-closed).
+inline bool child_apply_landlock(const char* safe_prefix) noexcept {
   constexpr std::uint64_t kReadOnly =
       LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
   constexpr std::uint64_t kReadWrite =
@@ -105,10 +105,8 @@ inline bool child_apply_landlock(std::string_view safe_prefix) noexcept {
   const int fd = static_cast<int>(rs_fd);
   bool ok = true;
 
-  // Workspace root (guarantee null-termination safely from string_view).
-  if (!safe_prefix.empty()) {
-    std::string prefix_str(safe_prefix);
-    ok = ok && add_path_rule(fd, prefix_str.c_str(), kReadOnly);
+  if (safe_prefix != nullptr && safe_prefix[0] != '\0') {
+    ok = ok && add_path_rule(fd, safe_prefix, kReadOnly);
   }
 
   // Standard runtime directories (explicitly omitting /proc).
@@ -117,7 +115,7 @@ inline bool child_apply_landlock(std::string_view safe_prefix) noexcept {
     if (!ok) break;
     ok = ok && add_path_rule(fd, d, kReadOnly);
   }
-  
+
   const char* rw_dirs[] = {"/dev", "/tmp"};
   for (const char* d : rw_dirs) {
     if (!ok) break;
@@ -142,6 +140,6 @@ inline bool child_apply_landlock(std::string_view safe_prefix) noexcept {
 #else
 namespace mcp_landlock {
 inline int probe_abi_version() noexcept { return -1; }
-inline bool child_apply_landlock(std::string_view) noexcept { return false; }
+inline bool child_apply_landlock(const char*) noexcept { return false; }
 }  // namespace mcp_landlock
 #endif
