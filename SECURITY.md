@@ -1,4 +1,4 @@
-# Security Model and Trust Boundaries (mcp-dfa-gate v0.6.0)
+# Security Model and Trust Boundaries (mcp-dfa-gate v0.6.2)
 
 ## 1. Formally Verified Properties (Lean 4)
 `lean/lattice_proof.lean` proves two universal theorems over all 64-bit taint-lattice policies and arbitrary-length traces (no Mathlib, no `sorry`, no `native_decide`):
@@ -44,6 +44,8 @@ Implemented in `include/seccomp_supervisor.hpp` and verified live on Linux in `t
 * **Sweep privilege model:** `pidfd_getfd(2)` requires `PTRACE_MODE_ATTACH_REALCREDS` over the target, which depends on credentials, dumpability, `kernel.yama.ptrace_scope`, user namespaces/capabilities, and LSMs — not a categorical `bwrap --unshare-pid` rule. Failures are classified (`vanished` `EBADF`/`ESRCH`, `eperm` `EPERM`/`EACCES`, `other`).
 * **`MCP_GATE_UNSHARE_NET=1` (`scripts/run_confined.sh`):** Appends `--unshare-net` for network-namespace isolation. This is a separate deployment mitigation — not equivalent to FD-sweep verification, and it does not cover `AF_UNIX`/`socketpair` channels.
 * **H4 (`v0.6.0` typed `argv`) trust boundary:** Closes the gate-side shell-parsing gap; downstream `execv`/`shell=False` execution, `argv[0]` re-checking, and `cwd`/read-only workspace confinement (`token_hits_symlink()` path-TOCTOU mitigation) remain the downstream trust boundary.
+
+* **Degraded `/proc` fallback under `hidepid`:** On kernels without `CONFIG_PROC_CHILDREN`, descendant discovery falls back to a global `/proc` `PPid` scan (`scan_proc_ppids()`). If `hidepid` also prevents reading `/proc/<pid>/status` for a setuid descendant, that process cannot be matched by `PPid` (on standard non-`hidepid` systems, `PPid` remains readable and the subsequent `SIGSTOP` fails closed via `undeliverable_stops`).
 
 ## 6. v0.6.2 Landlock `/proc/<pid>/mem` Hardening (Issue #4, Linux 5.13+)
 * **`MCP_GATE_LANDLOCK=1` (`include/landlock_sandbox.hpp`):** Installs a Linux 5.13+ Landlock ABI v1 ruleset (`READ_FILE | WRITE_FILE | READ_DIR`) in the downstream child before `execvp()`, allowlisting `SAFE_PREFIX` and standard runtime directories (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` read-only; `/tmp` read-write, and only `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom` read-write) while **omitting `/proc`**.
