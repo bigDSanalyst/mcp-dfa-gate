@@ -856,7 +856,7 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
     ::close(out_pipe[0]);
     ::close(out_pipe[1]);
     if (enable_landlock) {
-      if (!mcp_landlock::child_apply_landlock(safe_prefix)) {
+      if (!mcp_landlock::child_apply_landlock(safe_prefix.c_str())) {
         ::_exit(126);
       }
     }
