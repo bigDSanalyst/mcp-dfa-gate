@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -831,6 +832,66 @@ RelayResult relay_matching(LineReader& child, const std::string& id_raw) {
   return RelayResult::kLost;
 }
 
+// ---- v0.5: local-filesystem pin (audit: netfs mmap writeback exfiltration) ----
+// A workspace on a network filesystem (NFS/CIFS/9P/CEPH/FUSE) lets a tainted
+// process exfiltrate via mmap(MAP_SHARED) dirty-page writeback performed by
+// kernel helper threads, which never traverse the downstream seccomp filter.
+// Refuse to start unless the workspace is on a local filesystem. Operators can
+// explicitly accept the residual with MCP_GATE_ALLOW_NETFS=1.
+
+struct FsMagicEntry {
+  std::uint64_t magic;
+  const char* name;
+};
+
+constexpr std::array<FsMagicEntry, 7> kLocalFsMagics = {{
+    {0xEF53, "ext2/ext3/ext4"},
+    {0x58465342, "xfs"},
+    {0x9123683E, "btrfs"},
+    {0xF2F52010, "f2fs"},
+    {0x01021994, "tmpfs"},
+    {0x858458F6, "ramfs"},
+    {0x794C7630, "overlayfs"},
+}};
+
+constexpr std::array<FsMagicEntry, 9> kKnownNonLocalFsMagics = {{
+    {0x6969, "NFS"},
+    {0xFF534D42, "CIFS/SMB"},
+    {0xFE534D42, "SMB2"},
+    {0x65735546, "FUSE"},
+    {0x09061997, "9P"},
+    {0x00C36400, "CEPH"},
+    {0x6B414653, "AFS"},
+    {0x564C, "NCP"},
+    {0x9FA0, "procfs"},
+}};
+
+// Returns true when the workspace root is on a local filesystem. Any statfs
+// failure is fail-closed. `why` receives the fs name (or the error).
+bool workspace_fs_is_local(const char* path, std::string* why) {
+  struct statfs sfs {};
+  if (::statfs(path, &sfs) != 0) {
+    *why = std::string("statfs failed: ") + std::strerror(errno);
+    return false;
+  }
+  const std::uint64_t magic =
+      static_cast<std::uint64_t>(static_cast<unsigned long>(sfs.f_type));
+  for (const auto& e : kLocalFsMagics) {
+    if (e.magic == magic) {
+      *why = e.name;
+      return true;
+    }
+  }
+  *why = "unsupported (non-local or unknown)";
+  for (const auto& e : kKnownNonLocalFsMagics) {
+    if (e.magic == magic) {
+      *why = e.name;
+      break;
+    }
+  }
+  return false;
+}
+
 bool prefix_self_check(const std::string& safe_prefix) {
   if (safe_prefix.size() < 2 || safe_prefix.front() != '/' || safe_prefix.back() != '/') {
     return false;
@@ -885,6 +946,30 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // v0.5: fail closed on non-local workspace filesystems (mmap writeback
+  // exfiltration bypasses syscall mediation entirely).
+  {
+    std::string fs_name;
+    if (!workspace_fs_is_local(safe_prefix.c_str(), &fs_name)) {
+      const char* allow = std::getenv("MCP_GATE_ALLOW_NETFS");
+      if (allow == nullptr || std::strcmp(allow, "1") != 0) {
+        std::fprintf(stderr,
+                     "[mcp-dfa-gate] workspace '%s' is not on a local filesystem "
+                     "(type: %s). Network/special filesystems permit mmap writeback "
+                     "exfiltration that bypasses syscall mediation. Refusing to start "
+                     "(set MCP_GATE_ALLOW_NETFS=1 to accept this risk).\n",
+                     safe_prefix.c_str(), fs_name.c_str());
+        ::close(ws_fd);
+        return 2;
+      }
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] WARNING: MCP_GATE_ALLOW_NETFS=1 with non-local "
+                   "workspace fs (%s); mmap writeback exfiltration residual ACCEPTED "
+                   "by operator\n",
+                   fs_name.c_str());
+    }
+  }
+
   LatticeEngine engine;
   std::fprintf(stderr, "[mcp-dfa-gate] Policy: %.*s (SHA-256: %.*s)\n",
                static_cast<int>(mcp_lattice::policy::POLICY_NAME.size()),
@@ -904,6 +989,15 @@ int main(int argc, char** argv) {
   const char* sec_env = std::getenv("MCP_GATE_SECCOMP");
   const bool enable_seccomp = (sec_env != nullptr && std::strcmp(sec_env, "1") == 0);
 
+  // v0.5: clearance masks are needed by both the supervisor start and the
+  // quarantine-fence trigger below, so they are computed before the spawn.
+  const auto net_rule = mcp_lattice::lookup_rule("http_fetch");
+  const std::uint64_t net_clearance = net_rule ? net_rule->clearance_mask : 0ULL;
+  const auto exec_rule = mcp_lattice::lookup_rule("bash_workspace");
+  const std::uint64_t exec_clearance = exec_rule ? exec_rule->clearance_mask : 0ULL;
+  // Conservative fence trigger: any taint bit not cleared for BOTH channels.
+  const std::uint64_t combined_clearance = net_clearance | exec_clearance;
+
   std::atomic<std::uint64_t> shared_taint{0ULL};
   std::atomic<bool> shared_halted{false};
   mcp_seccomp::Supervisor supervisor;
@@ -916,12 +1010,8 @@ int main(int argc, char** argv) {
     return 3;
   }
   if (enable_seccomp) {
-    const auto net_rule = mcp_lattice::lookup_rule("http_fetch");
-    const std::uint64_t net_clearance = net_rule ? net_rule->clearance_mask : 0ULL;
-    const auto exec_rule = mcp_lattice::lookup_rule("bash_workspace");
-    const std::uint64_t exec_clearance = exec_rule ? exec_rule->clearance_mask : 0ULL;
     if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted,
-                          net_clearance, exec_clearance)) {
+                          net_clearance, exec_clearance, child.pid)) {
       std::fprintf(stderr, "[mcp-dfa-gate] failed to start seccomp supervisor\n");
       ::close(child.handoff_sock);
       ::close(ws_fd);
@@ -1016,8 +1106,26 @@ int main(int argc, char** argv) {
       // Fail closed if classifier marked UNKNOWN (e.g. unvetted bash_workspace command)
       const std::string_view effective_tool =
           (cls.category == ToolCategory::UNKNOWN) ? std::string_view("") : std::string_view(tool);
+      const auto st_before = engine.state();
       const auto r = engine.inspect_tool(effective_tool, is_sensitive);
       const auto st_after = engine.state();
+
+      // v0.5 quarantine fence: when this call raises uncleared taint (or halts
+      // the lattice) while the downstream tree may still hold live sockets,
+      // sever every socket object BEFORE the new taint becomes visible to the
+      // supervisor verdict loop. fence() is serialized against all verdicts,
+      // so no CONTINUE can be issued after the raise; write-family syscalls on
+      // severed sockets then fail with EPIPE without per-write mediation.
+      if (enable_seccomp) {
+        const std::uint64_t new_uncleared =
+            (st_after.taint & ~combined_clearance) & ~(st_before.taint & ~combined_clearance);
+        const bool raised =
+            (new_uncleared != 0ULL) || (st_after.halted && !st_before.halted);
+        if (raised) {
+          supervisor.fence(st_after.taint, st_after.halted);
+        }
+      }
+
       shared_taint.store(st_after.taint, std::memory_order_release);
       shared_halted.store(st_after.halted, std::memory_order_release);
 
