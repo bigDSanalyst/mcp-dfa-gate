@@ -1,4 +1,4 @@
-# mcp-dfa-gate (v0.5.1)
+# mcp-dfa-gate (v0.6.0)
 
 Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protocol (MCP) agents, backed by a 64-bit bitwise taint-lattice engine, a JSON policy-to-proof compiler, a Lean 4 universal Non-Interference proof, and a Linux `SECCOMP_RET_USER_NOTIF` quarantine fence.
 
@@ -23,14 +23,14 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
   * Fail-closed method allowlist (`initialize`, `initialized`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`).
   * Rebuilds `tools/call` frames from whitelisted fields; raw client JSON is never forwarded.
   * Linux `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` + `fstat(S_ISREG)` canonicalization (with `O_NOFOLLOW` fallback).
-  * Vetted read-only command allowlist for `bash_workspace` (blocks metacharacters, flag-embedded paths, dotfiles, sensitive suffixes, and symlinks).
+  * Vetted typed-argv contract for `bash_workspace` (v0.6, closes H4): arguments are `argv: [STRING, ...]`, vetted per element (10 read-only binaries; `find` side-effect flags, flag-embedded paths/assignments, `..`/`/.`, dotfiles, sensitive suffixes, out-of-prefix absolutes, and symlinks denied); the vetted array is forwarded verbatim for direct `execv(3)`-style execution -- no shell string parsing anywhere in the pipeline.
 
 ## Quick Start & Testing
 
 ```bash
 make policy        # Compile policies/enterprise_example.json -> C++20 + Lean 4
 make build         # Compile mcp-dfa-gate (-std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread)
-make test          # Run 24 hostile integration tests (tests/test_sidecar.py) -> 24/24
+make test          # Run 25 hostile integration tests (tests/test_sidecar.py) -> 25/25
 make test-seccomp  # Run 23 live-kernel red-team tests (tests/test_seccomp.py) -> 23/23
 make verify        # Check Lean 4 universal Non-Interference proof
 ```
@@ -67,13 +67,18 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 * **Fence failure fails closed (exit 43):** if any descendant cannot be verifiably stopped (e.g. stuck in uninterruptible `D` sleep, unreadable `/proc`, or the 1024-pid tracking cap is exceeded), the sidecar SIGKILLs the tree and exits 43 instead of resuming an unverified process. Mediated denies hold in every failure mode.
 * **New static-deny coverage test:** `process_vm_readv` is pinned by a live test alongside `ptrace`.
 
+## Upgrade Notes (v0.5.1 -> v0.6.0)
+
+* **BREAKING -- `bash_workspace` now takes a typed argv array (H4 closed):** `arguments` changed from `{"command": "sha256sum /ws/file.txt"}` to `{"argv": ["sha256sum", "/ws/file.txt"]}`. The shell command-string parser is deleted; the downstream executor contract is direct `execv(3)` on the vetted array (never a shell), so the gate and the executor can no longer disagree about command grammar. Filenames containing spaces or metacharacters are now ordinary data and work end to end.
+* **Error taxonomy split:** malformed `argv` (missing/non-array/empty, non-string/empty/oversized/non-printable elements, >256 elements, or the removed legacy `command` key) returns a clean JSON-RPC `-32602` with an actionable message -- nothing is forwarded and the session survives; well-formed but unvetted content keeps the v0.5 semantics (`-32001` plus permanent session absorption).
+* **Downstream implementers:** exec the forwarded `argv` array directly (`shell=False` / `posix_spawn`-equivalent) and re-check `argv[0]` against the vetted allowlist as defense in depth; run with `cwd` pinned to the workspace (as `scripts/run_confined.sh` does).
+
 ## Known Residuals
 
-See `SECURITY.md` for the full threat model and trust boundaries. Key residuals tracked for `v0.6`:
+See `SECURITY.md` for the full threat model and trust boundaries. Remaining v0.6-line items (H4 de-shell shipped in v0.6.0):
 
-* **`bash_workspace` shell parsing (H4):** Replacement with typed argv-array primitives is scheduled for `v0.6`.
-* **Confined (`bwrap`) fence boundary:** The FD sweep is verified in direct sidecar mode only. Under `bwrap --unshare-pid` with an unprivileged user namespace (or `kernel.yama.ptrace_scope >= 2`), `pidfd_getfd` may fail with `EPERM`; the fence emits a loud `FENCE WARNING` and mediated syscalls still deny, but pre-taint sockets may survive (`--unshare-net` mitigates; `bwrap`-mode testing and a sweep privilege model are tracked for `v0.6`).
-* **Landlock `/proc/<pid>/mem` hardening:** Scheduled for `v0.6` (Linux 5.13+).
+* **Confined (`bwrap`) fence boundary (#5):** The FD sweep is verified in direct sidecar mode only. Under `bwrap --unshare-pid` with an unprivileged user namespace (or `kernel.yama.ptrace_scope >= 2`), `pidfd_getfd` may fail with `EPERM`; the fence emits a loud `FENCE WARNING` and mediated syscalls still deny, but pre-taint sockets may survive (`--unshare-net` mitigates; live bwrap-mode fence testing and a sweep privilege model are tracked for a later v0.6.x release).
+* **Landlock `/proc/<pid>/mem` hardening (#4):** Tracked for a later v0.6.x release (Linux 5.13+).
 
 ## License
 

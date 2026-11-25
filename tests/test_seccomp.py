@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Linux kernel SECCOMP_RET_USER_NOTIF tests (v0.5.1).
+"""Live Linux kernel SECCOMP_RET_USER_NOTIF tests (v0.6.0).
 
 Coverage map (audit finding -> test):
   C1 pre-existing/inherited socket + write()  -> test_write_on_preconnected_socket_severed
@@ -17,7 +17,8 @@ Coverage map (audit finding -> test):
                                                 test_exec_chain_preserves_filter
   H3 ptrace inspection                        -> test_ptrace_static_denied
   H3 process_vm_readv inspection              -> test_process_vm_readv_static_denied
-  H4-class shell surface                      -> (v0.4 exec test retained; de-shell lands v0.6)
+  H4 shell-string surface                     -> closed in v0.6.0 (typed argv contract;
+                                                v0.4 exec mediation test retained)
   fail-closed supervisor death                -> test_supervisor_death_fails_closed
   listener fd hygiene                         -> test_fd_hygiene_no_listener_leak
   taint-raise race                            -> test_taint_raise_race_hammer
