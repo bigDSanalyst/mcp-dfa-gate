@@ -1,4 +1,4 @@
-# mcp-dfa-gate (v0.6.0)
+# mcp-dfa-gate (v0.6.2)
 
 Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protocol (MCP) agents, backed by a 64-bit bitwise taint-lattice engine, a JSON policy-to-proof compiler, a Lean 4 universal Non-Interference proof, and a Linux `SECCOMP_RET_USER_NOTIF` quarantine fence.
 
@@ -31,7 +31,7 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
 make policy        # Compile policies/enterprise_example.json -> C++20 + Lean 4
 make build         # Compile mcp-dfa-gate (-std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread)
 make test          # Run 25 hostile integration tests (tests/test_sidecar.py) -> 25/25
-make test-seccomp  # Run 26 live-kernel red-team tests (tests/test_seccomp.py) -> 26/26
+make test-seccomp  # Run 28 live-kernel red-team tests (tests/test_seccomp.py) -> 28/28
 make verify        # Check Lean 4 universal Non-Interference proof
 ```
 
@@ -79,12 +79,15 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 * **Target-scoped discovery & exact socket identity:** Descendant discovery walks `/proc/<pid>/task/<tid>/children` recursively (falling back to `/proc` ppid-walk only if unavailable); socket deduplication uses exact `(st_dev, st_ino)` pairs; `pidfd_getfd` failures are classified into `vanished`/`eperm`/`other`.
 * **`scripts/run_confined.sh`:** Added optional `MCP_GATE_UNSHARE_NET=1` (`--unshare-net`).
 
+## Upgrade Notes (v0.6.1 -> v0.6.2)
+
+* **Landlock `/proc/<pid>/mem` hardening (`MCP_GATE_LANDLOCK=1`, Linux 5.13+):** Opt-in Landlock ABI v1 ruleset allowlists `SAFE_PREFIX` and runtime directories while excluding `/proc`, blocking `/proc/self/mem` and `/proc/<pid>/mem` with `EACCES` (fails closed with exit **3** if Landlock is unavailable). Composes cleanly with `MCP_GATE_SECCOMP=1`.
+
 ## Known Residuals
 
 See `SECURITY.md` for the full threat model and trust boundaries. Remaining v0.6-line items (H4 de-shell shipped in v0.6.0):
 
-* **Confined (`bwrap`) fence boundary (#5):** The FD sweep is verified in direct sidecar mode only. Under `bwrap --unshare-pid` with an unprivileged user namespace (or `kernel.yama.ptrace_scope >= 2`), `pidfd_getfd` may fail with `EPERM`; the fence emits a loud `FENCE WARNING` and mediated syscalls still deny, but pre-taint sockets may survive (`--unshare-net` mitigates; live bwrap-mode fence testing and a sweep privilege model are tracked for a later v0.6.x release).
-* **Landlock `/proc/<pid>/mem` hardening (#4):** Tracked for a later v0.6.x release (Linux 5.13+).
+* All `v0.6` roadmap items (#3 H4 de-shell, #5 strict-by-default fence & `bwrap` coverage, #4 Landlock `/proc/<pid>/mem` hardening) are shipped; see `SECURITY.md` for remaining out-of-scope deployment boundaries.
 
 ## License
 

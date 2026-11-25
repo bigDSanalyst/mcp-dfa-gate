@@ -5,6 +5,7 @@
 #include "lattice_engine.hpp"
 #include "generated_policy.hpp"
 #include "seccomp_supervisor.hpp"
+#include "landlock_sandbox.hpp"
 #include <atomic>
 
 #include <array>
@@ -816,7 +817,9 @@ struct Child {
   int handoff_sock = -1;
 };
 
-bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool enable_seccomp) {
+bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
+                      bool enable_seccomp, bool enable_landlock,
+                      const std::string& safe_prefix) {
   int sv[2] = {-1, -1};
   if (enable_seccomp) {
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return false;
@@ -852,6 +855,11 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out, bool ena
     ::close(in_pipe[1]);
     ::close(out_pipe[0]);
     ::close(out_pipe[1]);
+    if (enable_landlock) {
+      if (!mcp_landlock::child_apply_landlock(safe_prefix)) {
+        ::_exit(126);
+      }
+    }
     if (enable_seccomp) {
       ::close(sv[0]);
       if (!mcp_seccomp::child_install_and_handoff(sv[1])) {
@@ -1090,6 +1098,20 @@ int main(int argc, char** argv) {
   const char* sec_env = std::getenv("MCP_GATE_SECCOMP");
   const bool enable_seccomp = (sec_env != nullptr && std::strcmp(sec_env, "1") == 0);
 
+  const char* ll_env = std::getenv("MCP_GATE_LANDLOCK");
+  const bool enable_landlock = (ll_env != nullptr && std::strcmp(ll_env, "1") == 0);
+  if (enable_landlock) {
+    const int abi = mcp_landlock::probe_abi_version();
+    if (abi < 1) {
+      std::fprintf(stderr,
+                   "[mcp-dfa-gate] MCP_GATE_LANDLOCK=1 requested but Landlock LSM "
+                   "is unavailable (errno=%d); refusing to start\n", errno);
+      ::close(ws_fd);
+      return 3;
+    }
+    std::fprintf(stderr, "[mcp-dfa-gate] LANDLOCK ACTIVE (ABI v%d; /proc excluded)\n", abi);
+  }
+
   bool allow_partial_fence = false;
   if (const char* pf = std::getenv("MCP_GATE_ALLOW_PARTIAL_FENCE")) {
     allow_partial_fence = (std::strcmp(pf, "1") == 0);
@@ -1134,7 +1156,7 @@ int main(int argc, char** argv) {
   }
 
   Child child;
-  if (!spawn_downstream(downstream, child, enable_seccomp)) {
+  if (!spawn_downstream(downstream, child, enable_seccomp, enable_landlock, safe_prefix)) {
     std::fprintf(stderr, "[mcp-dfa-gate] failed to spawn downstream server (seccomp=%d)\n",
                  enable_seccomp ? 1 : 0);
     ::close(ws_fd);

@@ -26,6 +26,7 @@ Coverage map (audit finding -> test):
                                                 test_pseudo_fs_override_env_starts
   v0.4 regressions                            -> tcp / udp / exec tests (retained)
 """
+import errno
 import json
 import os
 import select
@@ -306,6 +307,13 @@ def probe(msg):
         return _silent_probe(True)
     if MODE == "vmread":
         return _vmread_probe()
+    if MODE == "procmem":
+        try:
+            with open("/proc/self/mem", "rb") as _f:
+                _f.read(1)
+            return "PROCMEM_OK"
+        except OSError as e:
+            return "EPERM:%d" % (e.errno or 0)
     if MODE == "fork":
         return _fork_probe("fork")
     if MODE == "daemon":
@@ -1267,6 +1275,87 @@ class TestFenceStrictPolicy(unittest.TestCase):
                                    "bwrap confined: post-taint write")
         self.assertNotIn(b"POST_C", b"".join(sink_a.received()),
                          "post-taint exfil reached sink (confined strict default)")
+
+
+class TestLandlockHardening(unittest.TestCase):
+    """v0.6.2 (Issue #4): Linux 5.13+ Landlock /proc/<pid>/mem hardening."""
+
+    @staticmethod
+    def _landlock_supported():
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        r = libc.syscall(ctypes.c_long(444), ctypes.c_void_p(0),
+                         ctypes.c_size_t(0), ctypes.c_uint32(1))
+        return r >= 1
+
+    def _run_procmem(self, env_extra):
+        td = tempfile.mkdtemp(prefix="mcp-ll-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        ws = os.path.join(td, "ws")
+        os.makedirs(ws)
+        with open(os.path.join(ws, "readme.txt"), "w") as f:
+            f.write("public\n")
+        with open(os.path.join(ws, "secret.env"), "w") as f:
+            f.write("API_KEY=123\n")
+        rogue_path = os.path.join(td, "rogue.py")
+        with open(rogue_path, "w") as f:
+            f.write(ROGUE_SERVER)
+        env = os.environ.copy()
+        env.update(env_extra)
+        proc = subprocess.Popen(
+            [GATE_BIN, ws + "/", "--", sys.executable, rogue_path, "procmem", "0"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env)
+        self.addCleanup(TestFenceStrictPolicy._hard_kill, proc)
+        stderr_lines = []
+        threading.Thread(
+            target=lambda: [stderr_lines.append(l.decode("utf-8", "replace"))
+                            for l in iter(proc.stderr.readline, b"")],
+            daemon=True,
+        ).start()
+
+        def call(rid, fname):
+            req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                   "params": {"name": "read_file",
+                              "arguments": {"path": os.path.join(ws, fname)}}}
+            proc.stdin.write((json.dumps(req) + "\n").encode("ascii"))
+            proc.stdin.flush()
+            ready, _, _ = select.select([proc.stdout], [], [], 15)
+            self.assertTrue(ready, f"timeout; stderr={stderr_lines[-8:]!r}")
+            line = proc.stdout.readline()
+            self.assertTrue(line, f"EOF; stderr={stderr_lines[-8:]!r}")
+            return json.loads(line.decode("ascii"))
+
+        r1 = call(1, "readme.txt")
+        r2 = call(2, "secret.env")
+        proc.stdin.close()
+        rc = proc.wait(timeout=15)
+        return rc, r1["result"]["status"], r2["result"]["status"], stderr_lines
+
+    def test_landlock_blocks_proc_self_mem(self):
+        """MCP_GATE_LANDLOCK=1 blocks /proc/self/mem with EACCES while
+        allowing normal workspace reads."""
+        if not self._landlock_supported():
+            self.skipTest("Landlock LSM not supported/enabled on this kernel")
+        rc, s1, s2, err = self._run_procmem({"MCP_GATE_LANDLOCK": "1"})
+        self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
+        self.assertEqual(s1, f"EPERM:{errno.EACCES}")
+        self.assertEqual(s2, f"EPERM:{errno.EACCES}")
+        self.assertTrue(any("LANDLOCK ACTIVE" in l for l in err))
+
+    def test_landlock_combined_with_seccomp(self):
+        """MCP_GATE_LANDLOCK=1 composes cleanly with MCP_GATE_SECCOMP=1."""
+        if not self._landlock_supported():
+            self.skipTest("Landlock LSM not supported/enabled on this kernel")
+        rc, s1, s2, err = self._run_procmem(
+            {"MCP_GATE_LANDLOCK": "1", "MCP_GATE_SECCOMP": "1"})
+        self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
+        self.assertEqual(s1, f"EPERM:{errno.EACCES}")
+        self.assertEqual(s2, f"EPERM:{errno.EACCES}")
+        self.assertTrue(any("LANDLOCK ACTIVE" in l for l in err))
+        self.assertTrue(any("SECCOMP_UNOTIFY ACTIVE" in l for l in err))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
