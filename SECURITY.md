@@ -44,3 +44,8 @@ Implemented in `include/seccomp_supervisor.hpp` and verified live on Linux in `t
 * **Sweep privilege model:** `pidfd_getfd(2)` requires `PTRACE_MODE_ATTACH_REALCREDS` over the target, which depends on credentials, dumpability, `kernel.yama.ptrace_scope`, user namespaces/capabilities, and LSMs — not a categorical `bwrap --unshare-pid` rule. Failures are classified (`vanished` `EBADF`/`ESRCH`, `eperm` `EPERM`/`EACCES`, `other`).
 * **`MCP_GATE_UNSHARE_NET=1` (`scripts/run_confined.sh`):** Appends `--unshare-net` for network-namespace isolation. This is a separate deployment mitigation — not equivalent to FD-sweep verification, and it does not cover `AF_UNIX`/`socketpair` channels.
 * **H4 (`v0.6.0` typed `argv`) trust boundary:** Closes the gate-side shell-parsing gap; downstream `execv`/`shell=False` execution, `argv[0]` re-checking, and `cwd`/read-only workspace confinement (`token_hits_symlink()` path-TOCTOU mitigation) remain the downstream trust boundary.
+
+## 6. v0.6.2 Landlock `/proc/<pid>/mem` Hardening (Issue #4, Linux 5.13+)
+* **`MCP_GATE_LANDLOCK=1` (`include/landlock_sandbox.hpp`):** Installs a Linux 5.13+ Landlock ABI v1 ruleset (`READ_FILE | WRITE_FILE | READ_DIR`) in the downstream child before `execvp()`, allowlisting `SAFE_PREFIX` and standard runtime directories (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` read-only; `/dev`, `/tmp` read-write) while **omitting `/proc`**.
+* **`/proc/<pid>/mem` denied:** Opening `/proc/self/mem`, `/proc/<pid>/mem`, `/proc/thread-self/mem`, `/proc/self/maps`, or `/proc/self/environ` fails with `EACCES`.
+* **Fail-closed startup:** If `MCP_GATE_LANDLOCK=1` is set on a kernel without Landlock (`ENOSYS` / `EOPNOTSUPP`), the sidecar refuses to start (exit **3**).
