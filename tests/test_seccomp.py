@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Linux kernel SECCOMP_RET_USER_NOTIF tests (v0.5.1).
+"""Live Linux kernel SECCOMP_RET_USER_NOTIF tests (v0.6.0).
 
 Coverage map (audit finding -> test):
   C1 pre-existing/inherited socket + write()  -> test_write_on_preconnected_socket_severed
@@ -17,7 +17,8 @@ Coverage map (audit finding -> test):
                                                 test_exec_chain_preserves_filter
   H3 ptrace inspection                        -> test_ptrace_static_denied
   H3 process_vm_readv inspection              -> test_process_vm_readv_static_denied
-  H4-class shell surface                      -> (v0.4 exec test retained; de-shell lands v0.6)
+  H4 shell-string surface                     -> closed in v0.6.0 (typed argv contract;
+                                                v0.4 exec mediation test retained)
   fail-closed supervisor death                -> test_supervisor_death_fails_closed
   listener fd hygiene                         -> test_fd_hygiene_no_listener_leak
   taint-raise race                            -> test_taint_raise_race_hammer
@@ -116,6 +117,20 @@ def _silent_probe(daemonize):
     # (pipe read/write and raw socket write only). v0.5.0 registered pids
     # only when they triggered a notification, so this holder's inherited
     # socket survived the fence -- a C1 bypass.
+    #
+    # v0.6 test-hardening: the canary is HANDSHAKEN. Under CPU starvation a
+    # forked holder can be preempted between fork() and its canary write for
+    # the entire call-1 -> call-2 window; the fence then severs the socket
+    # first, and the (previously unguarded) canary write died with EPIPE,
+    # silently exiting the holder ("ERR:no-child-response" flake). A/B
+    # against the released v0.5.1 binary reproduced the same flake, and a
+    # 0.3s-sleep control eliminated it (10/20 -> 0/20): the GATE was correct
+    # in every such run -- discovered, stopped, severed, resumed -- while
+    # the harness raced its own canary. The holder now reports PRE_OK (or
+    # the canary write's errno) on the result pipe before the first call
+    # returns, so "OK" proves the canary phase completed before call 2 can
+    # trigger the fence; every write is guarded and reported through the
+    # pipe instead of killing the holder.
     if "spipes" not in STATE:
         sock = _connect()
         fd = sock.fileno()
@@ -130,7 +145,11 @@ def _silent_probe(daemonize):
                     os.setsid()
                     if os.fork() != 0:
                         os._exit(0)
-                os.write(fd, b"CHILD_PRE")   # prove the inherited copy is live
+                try:
+                    os.write(fd, b"CHILD_PRE")   # prove the inherited copy is live
+                    os.write(res_w, b"PRE_OK")    # handshake: canary phase done
+                except OSError as e:
+                    os.write(res_w, ("PRE_ERR:%d" % (e.errno or 0)).encode())
                 if not os.read(cmd_r, 1):
                     os._exit(0)
                 try:
@@ -145,6 +164,12 @@ def _silent_probe(daemonize):
         if daemonize:
             os.waitpid(pid, 0)  # reap the intermediate; grandchild is orphaned
         sock.close()  # parent drops its copy: only the child holds the object
+        # Block until the holder confirms the canary landed (or reports its
+        # errno): "OK" is only returned once the pre-taint write completed,
+        # so the fence can never sever underneath an in-flight canary.
+        hs = os.read(res_r, 64)
+        if hs != b"PRE_OK":
+            return hs.decode() if hs else "ERR:no-child-response"
         STATE["spipes"] = (cmd_w, res_r)
         return "OK"
     cmd_w, res_r = STATE["spipes"]
@@ -437,6 +462,10 @@ class Sink:
             while not self.stop.is_set():
                 try:
                     c, _ = self.sock.accept()
+                    # v0.6: fork-delayed canaries (silent-descendant tests)
+                    # can land well after accept; hold the first recv longer
+                    # than the accept cadence so the bytes are not dropped.
+                    c.settimeout(1.0)
                     try:
                         data = c.recv(4096)
                         if data:

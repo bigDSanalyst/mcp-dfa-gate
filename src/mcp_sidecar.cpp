@@ -47,6 +47,7 @@ constexpr std::size_t kMaxLine = 1u << 20;
 
 constexpr int kErrParse = -32700;
 constexpr int kErrInvalidRequest = -32600;
+constexpr int kErrInvalidParams = -32602;
 constexpr int kErrPolicyDenied = -32001;
 constexpr int kErrCanonicalization = -32002;
 constexpr int kErrMethodBlocked = -32004;
@@ -527,6 +528,16 @@ constexpr std::array<std::string_view, 8> kFindBlockedFlags = {
     "-exec", "-execdir", "-ok", "-okdir", "-delete",
     "-fprint", "-fprintf", "-fls"};
 
+// v0.6 (H4 de-shell): bash_workspace takes a TYPED argv array, not a shell
+// command string. The client supplies JSON {"argv": ["ls", "-l", "."]}; the
+// gate vets each element as one argv word and forwards the array verbatim;
+// the downstream executor contract is execv(3)-family on that exact array --
+// no shell is ever consulted, so the gate's verdict and the executor's
+// behavior cannot disagree about grammar (the v0.5 string-parser semantic
+// gap is structurally gone). Bounded to keep forwarded frames sane.
+constexpr std::size_t kMaxArgvElements = 256;
+constexpr std::size_t kMaxArgvElementBytes = 1024;
+
 bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_prefix) {
   std::string rel;
   if (!t.empty() && t[0] == '/') {
@@ -562,62 +573,62 @@ bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_pre
   return false;
 }
 
-bool is_vetted_command(std::string_view cmd, std::string_view safe_prefix, int ws_fd) {
-  if (cmd.empty()) return false;
-  for (const char c : cmd) {
+[[nodiscard]] bool argv_element_printable_ascii(std::string_view t) noexcept {
+  for (const char c : t) {
     const auto u = static_cast<unsigned char>(c);
     if (u >= 0x80 || u < 0x20 || u == 0x7F) return false;
-    switch (c) {
-      case ';': case '|': case '&': case '`': case '$': case '>': case '<':
-      case '(': case ')': case '{': case '}': case '[': case ']': case '!':
-      case '#': case '"': case '\'': case '\\': case '~': case '*': case '?':
-        return false;
-      default: break;
-    }
   }
-  if (cmd.find("..") != std::string_view::npos ||
-      cmd.find("/.") != std::string_view::npos) {
-    return false;
-  }
+  return true;
+}
 
-  std::vector<std::string_view> tokens;
-  std::size_t i = 0;
-  while (i < cmd.size()) {
-    while (i < cmd.size() && (cmd[i] == ' ' || cmd[i] == '\t')) ++i;
-    const std::size_t j = i;
-    while (i < cmd.size() && cmd[i] != ' ' && cmd[i] != '\t') ++i;
-    if (i > j) tokens.push_back(cmd.substr(j, i - j));
-  }
-  if (tokens.empty()) return false;
+// v0.6 (H4): content vetting of a shape-valid typed argv array. The caller
+// has already established the shape (non-empty JSON array of non-empty
+// printable-ASCII strings within the size bounds). A false return means the
+// CONTENT is unvetted: the call is classified UNKNOWN and hits the exact
+// v0.5 policy path (deny -32001 plus permanent session absorption). With no
+// shell in the picture, metacharacters are no longer grammar -- a filename
+// containing ';' or '|' is ordinary data -- so the v0.5 character denylist
+// and whitespace tokenizer are deleted rather than ported. What remains are
+// the rules that still mean something one-argv-word-at-a-time.
+[[nodiscard]] bool is_vetted_argv(const std::vector<std::string>& argv,
+                                  std::string_view safe_prefix, int ws_fd) {
+  if (argv.empty()) return false;
 
   bool program_ok = false;
   for (const auto v : kVettedCommands) {
-    if (tokens[0] == v) {
+    if (argv[0] == v) {
       program_ok = true;
       break;
     }
   }
   if (!program_ok) return false;
 
-  if (tokens[0] == "find") {
-    for (const auto t : tokens) {
+  if (argv[0] == "find") {
+    for (const auto& t : argv) {
       for (const auto bad : kFindBlockedFlags) {
         if (t == bad) return false;
       }
     }
   }
 
-  for (std::size_t k = 1; k < tokens.size(); ++k) {
-    const std::string_view t = tokens[k];
-    if (t.empty()) continue;
+  for (std::size_t k = 1; k < argv.size(); ++k) {
+    const std::string_view t = argv[k];
+    // Traversal substrings are rejected in every element, flags included
+    // (v0.5 checked them over the whole command string; per-element keeps
+    // the same coverage without the string parse).
+    if (t.find("..") != std::string_view::npos ||
+        t.find("/.") != std::string_view::npos) {
+      return false;
+    }
     if (t[0] == '-') {
+      // Flags must stay flags: no embedded paths or assignments.
       if (t.find('/') != std::string_view::npos ||
           t.find('=') != std::string_view::npos) {
         return false;
       }
       continue;
     }
-    if (t != "." && t[0] == '.') return false;
+    if (t != "." && t[0] == '.') return false;  // dotfiles
     constexpr std::array<std::string_view, 6> blocked_suffixes = {
         ".pem", ".key", ".p12", ".sql", ".env", ".kdbx"};
     for (const auto suffix : blocked_suffixes) {
@@ -643,18 +654,23 @@ enum class ToolCategory : std::uint8_t {
 struct Classification {
   ToolCategory category = ToolCategory::UNKNOWN;
   bool canonical_ok = true;
+  // v0.6 (H4): argv-contract violations are client contract errors, not
+  // policy events. shape_ok == false short-circuits the lattice entirely:
+  // the call is refused with -32602, nothing is forwarded, and the session
+  // state is untouched (a malformed frame must not cost the client the
+  // session). Well-formed but unvetted content keeps the v0.5 UNKNOWN path.
+  bool shape_ok = true;
+  std::string shape_msg;
   std::string forward_arg;
+  std::vector<std::string> forward_argv;
 };
 
 Classification classify_for_gate(std::string_view tool, const json::Node* arguments,
                                  std::string_view safe_prefix, int ws_fd) {
   Classification out;
-  const char* key = (tool == "read_file") ? "path"
-                  : (tool == "bash_workspace") ? "command"
-                  : "url";
   const json::Node* arg = nullptr;
   if (arguments != nullptr && arguments->type == json::Node::Type::kObj) {
-    arg = arguments->find(key);
+    arg = arguments->find((tool == "read_file") ? "path" : "url");
   }
   const bool have_arg = (arg != nullptr && arg->type == json::Node::Type::kStr);
 
@@ -678,12 +694,83 @@ Classification classify_for_gate(std::string_view tool, const json::Node* argume
     return out;
   }
   if (tool == "bash_workspace") {
-    const std::string cmd = have_arg ? arg->str : std::string();
-    if (!is_vetted_command(cmd, safe_prefix, ws_fd)) {
+    // v0.6 (H4): typed argv-array contract. The 'command' shell string is
+    // gone; shape errors are refused cleanly, content violations stay
+    // policy denials with session absorption.
+    const json::Node* argv_n = nullptr;
+    const json::Node* legacy_n = nullptr;
+    if (arguments != nullptr && arguments->type == json::Node::Type::kObj) {
+      argv_n = arguments->find("argv");
+      legacy_n = arguments->find("command");
+    }
+    const bool legacy_command = (legacy_n != nullptr && argv_n == nullptr);
+    const char* base_hint =
+        "bash_workspace requires 'argv': a non-empty JSON array of "
+        "printable-ASCII strings (max 256 elements, 1024 bytes each)";
+    if (legacy_command) {
+      out.shape_ok = false;
+      out.shape_msg = std::string(base_hint) +
+          "; shell command strings ('command') are no longer accepted -- "
+          "split the command into words and pass them as typed argv";
+      return out;
+    }
+    if (argv_n == nullptr) {
+      out.shape_ok = false;
+      out.shape_msg = base_hint;
+      return out;
+    }
+    if (argv_n->type != json::Node::Type::kArr) {
+      out.shape_ok = false;
+      out.shape_msg = std::string(base_hint) + "; got a non-array 'argv'";
+      return out;
+    }
+    if (argv_n->items.empty()) {
+      out.shape_ok = false;
+      out.shape_msg = std::string(base_hint) + "; 'argv' must not be empty";
+      return out;
+    }
+    if (argv_n->items.size() > kMaxArgvElements) {
+      out.shape_ok = false;
+      out.shape_msg = std::string(base_hint) +
+          "; too many elements (limit 256)";
+      return out;
+    }
+    std::vector<std::string> argv;
+    argv.reserve(argv_n->items.size());
+    for (const auto& item : argv_n->items) {
+      if (item.type != json::Node::Type::kStr) {
+        out.shape_ok = false;
+        out.shape_msg = std::string(base_hint) +
+            "; every element must be a JSON string";
+        return out;
+      }
+      if (item.str.empty()) {
+        out.shape_ok = false;
+        out.shape_msg = std::string(base_hint) +
+            "; elements must be non-empty";
+        return out;
+      }
+      if (item.str.size() > kMaxArgvElementBytes) {
+        out.shape_ok = false;
+        out.shape_msg = std::string(base_hint) +
+            "; element exceeds 1024 bytes";
+        return out;
+      }
+      if (!argv_element_printable_ascii(item.str)) {
+        out.shape_ok = false;
+        out.shape_msg = std::string(base_hint) +
+            "; elements must be printable 7-bit ASCII (control bytes, DEL,"
+            " and non-ASCII -- including \\u escapes decoding to them -- are"
+            " rejected; embedded NUL would truncate the word at exec time)";
+        return out;
+      }
+      argv.push_back(item.str);
+    }
+    if (!is_vetted_argv(argv, safe_prefix, ws_fd)) {
       out.category = ToolCategory::UNKNOWN;
       return out;
     }
-    out.forward_arg = cmd;
+    out.forward_argv = std::move(argv);
     out.category = ToolCategory::EXEC_WORKSPACE;
     return out;
   }
@@ -692,7 +779,7 @@ Classification classify_for_gate(std::string_view tool, const json::Node* argume
 }
 
 std::string build_forwarded_call(const std::string& id_raw, bool is_notification,
-                                 std::string_view tool, std::string_view forward_arg) {
+                                 std::string_view tool, const Classification& cls) {
   std::string out = "{\"jsonrpc\":\"2.0\"";
   if (!is_notification) {
     out += ",\"id\":";
@@ -703,12 +790,20 @@ std::string build_forwarded_call(const std::string& id_raw, bool is_notification
   out += ",\"arguments\":{";
   if (tool == "read_file") {
     out += "\"path\":";
+    out += json_escape(cls.forward_arg);
   } else if (tool == "bash_workspace") {
-    out += "\"command\":";
+    // v0.6 (H4): forward the vetted typed array verbatim. The downstream
+    // contract is direct execv(3) on this exact array -- never a shell.
+    out += "\"argv\":[";
+    for (std::size_t i = 0; i < cls.forward_argv.size(); ++i) {
+      if (i != 0) out += ',';
+      out += json_escape(cls.forward_argv[i]);
+    }
+    out += ']';
   } else {
     out += "\"url\":";
+    out += json_escape(cls.forward_arg);
   }
-  out += json_escape(forward_arg);
   out += "}}}";
   return out;
 }
@@ -1126,6 +1221,22 @@ int main(int argc, char** argv) {
 
       const Classification cls =
           classify_for_gate(tool, arguments, safe_prefix, ws_fd);
+
+      // v0.6 (H4): argv-contract violations are refused before the lattice:
+      // no state change, no forward, a clean -32602 with an actionable
+      // message (a malformed frame is a client bug, not a policy event).
+      // Content-level violations never reach this branch -- they classify as
+      // UNKNOWN below and keep the v0.5 deny-and-absorb semantics.
+      if (!cls.shape_ok) {
+        std::fprintf(stderr,
+                     "[mcp-dfa-gate] seq=%lu tool=\"%s\" REJECTED (argv contract violation)\n",
+                     seq, tool.c_str());
+        if (!is_notification) {
+          emit(STDOUT_FILENO, make_error(id_raw, kErrInvalidParams, cls.shape_msg));
+        }
+        continue;
+      }
+
       const bool is_sensitive = (cls.category == ToolCategory::SENSITIVE_READ);
       // Fail closed if classifier marked UNKNOWN (e.g. unvetted bash_workspace command)
       const std::string_view effective_tool =
@@ -1189,7 +1300,7 @@ int main(int argc, char** argv) {
       }
 
       const std::string forwarded =
-          build_forwarded_call(id_raw, is_notification, tool, cls.forward_arg);
+          build_forwarded_call(id_raw, is_notification, tool, cls);
       if (!is_notification && timeout_secs > 0) {
         ::alarm(static_cast<unsigned>(timeout_secs));
       }
