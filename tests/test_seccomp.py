@@ -308,12 +308,23 @@ def probe(msg):
     if MODE == "vmread":
         return _vmread_probe()
     if MODE == "procmem":
-        try:
-            with open("/proc/self/mem", "rb") as _f:
-                _f.read(1)
-            return "PROCMEM_OK"
-        except OSError as e:
-            return "EPERM:%d" % (e.errno or 0)
+        _pid = os.getpid()
+        _paths = (
+            "/proc/self/mem",
+            f"/proc/{_pid}/mem",
+            "/proc/thread-self/mem",
+            "/proc/self/maps",
+            "/proc/self/environ",
+        )
+        _errnos = set()
+        for _p in _paths:
+            try:
+                with open(_p, "rb") as _f:
+                    _f.read(1)
+                return "PROCMEM_OK:" + _p
+            except OSError as e:
+                _errnos.add(e.errno or 0)
+        return "EPERM:%d" % next(iter(_errnos)) if len(_errnos) == 1 else "MIXED:%r" % (sorted(_errnos),)
     if MODE == "selfread":
         try:
             with open(EXTRA, "rb") as _f:

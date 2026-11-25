@@ -2,11 +2,11 @@
 // v0.6.2 (Issue #4): Linux 5.13+ Landlock LSM filesystem confinement.
 //
 // Landlock is an allowlist-only LSM (no deny rules). To block /proc/<pid>/mem,
-// /proc/self/mem, and /proc/thread-self/mem, the child installs an ABI v1
-// ruleset handling READ_FILE | WRITE_FILE | READ_DIR and allowlists only the
-// workspace (SAFE_PREFIX) and standard runtime directories -- explicitly
-// omitting /proc. Enabled via MCP_GATE_LANDLOCK=1; fails closed (exit 3) at
-// startup if the kernel does not support Landlock.
+// /proc/self/mem, /proc/thread-self/mem, /proc/self/maps, and /proc/self/environ,
+// the child installs an ABI v1 ruleset handling READ_FILE | WRITE_FILE | READ_DIR
+// and allowlists only the workspace (SAFE_PREFIX), standard runtime directories,
+// /tmp, and specific safe /dev nodes -- explicitly omitting /proc. Enabled via
+// MCP_GATE_LANDLOCK=1; fails closed (exit 3) at startup if Landlock is unavailable.
 
 #include <cerrno>
 #include <cstddef>
@@ -48,6 +48,9 @@ enum landlock_rule_type {
 #endif
 #endif
 
+#if !defined(SYS_landlock_create_ruleset) || !defined(SYS_landlock_add_rule) || \
+    !defined(SYS_landlock_restrict_self)
+#if defined(__x86_64__) || defined(__aarch64__)
 #ifndef SYS_landlock_create_ruleset
 #define SYS_landlock_create_ruleset 444
 #endif
@@ -56,6 +59,10 @@ enum landlock_rule_type {
 #endif
 #ifndef SYS_landlock_restrict_self
 #define SYS_landlock_restrict_self 446
+#endif
+#else
+#error "Landlock syscall numbers undefined on this architecture"
+#endif
 #endif
 
 namespace mcp_landlock {
@@ -73,7 +80,7 @@ inline bool add_path_rule(int ruleset_fd, const char* path,
                           std::uint64_t access) noexcept {
   const int fd = ::open(path, O_PATH | O_CLOEXEC);
   if (fd < 0) {
-    // Missing optional system dir (e.g., /lib64 on some distros) is benign.
+    // Missing optional system dir/node (e.g., /lib64 on some distros) is benign.
     return errno == ENOENT;
   }
   struct landlock_path_beneath_attr attr {};
@@ -89,14 +96,16 @@ inline bool add_path_rule(int ruleset_fd, const char* path,
 // Async-signal-safe (zero heap allocation). Returns false on any error
 // (caller must _exit(126) fail-closed).
 inline bool child_apply_landlock(const char* safe_prefix) noexcept {
-  constexpr std::uint64_t kReadOnly =
+  constexpr std::uint64_t kDirRO =
       LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-  constexpr std::uint64_t kReadWrite =
+  constexpr std::uint64_t kDirRW =
       LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
       LANDLOCK_ACCESS_FS_READ_DIR;
+  constexpr std::uint64_t kFileRW =
+      LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
   struct landlock_ruleset_attr attr {};
-  attr.handled_access_fs = kReadWrite;
+  attr.handled_access_fs = kDirRW;
 
   const long rs_fd = ::syscall(SYS_landlock_create_ruleset, &attr,
                                sizeof attr, 0U);
@@ -106,20 +115,26 @@ inline bool child_apply_landlock(const char* safe_prefix) noexcept {
   bool ok = true;
 
   if (safe_prefix != nullptr && safe_prefix[0] != '\0') {
-    ok = ok && add_path_rule(fd, safe_prefix, kReadOnly);
+    ok = ok && add_path_rule(fd, safe_prefix, kDirRO);
   }
 
-  // Standard runtime directories (explicitly omitting /proc).
+  // Standard runtime directories (explicitly omitting /proc and recursive /dev).
   const char* ro_dirs[] = {"/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"};
   for (const char* d : ro_dirs) {
     if (!ok) break;
-    ok = ok && add_path_rule(fd, d, kReadOnly);
+    ok = ok && add_path_rule(fd, d, kDirRO);
   }
 
-  const char* rw_dirs[] = {"/dev", "/tmp"};
-  for (const char* d : rw_dirs) {
+  if (ok) {
+    ok = add_path_rule(fd, "/tmp", kDirRW);
+  }
+
+  // Narrow /dev grant to specific safe character devices only (file-only mask).
+  const char* dev_nodes[] = {
+      "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom"};
+  for (const char* dev : dev_nodes) {
     if (!ok) break;
-    ok = ok && add_path_rule(fd, d, kReadWrite);
+    ok = ok && add_path_rule(fd, dev, kFileRW);
   }
 
   if (!ok) {
