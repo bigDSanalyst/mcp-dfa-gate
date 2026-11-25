@@ -941,6 +941,65 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
                 proc.wait()
 
 
+class _PersistentSink:
+    """TCP sink that keeps each accepted connection open until EOF so
+    multi-write residual tests capture both PRE_C and POST_C."""
+    def __init__(self):
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self.port = self._srv.getsockname()[1]
+        self._srv.listen(4)
+        self._srv.settimeout(0.2)
+        self._stop = threading.Event()
+        self._chunks = []
+        self._lock = threading.Lock()
+        self._t = threading.Thread(target=self._accept_loop, daemon=True)
+        self._t.start()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._read_conn, args=(conn,), daemon=True).start()
+
+    def _read_conn(self, conn):
+        conn.settimeout(0.5)
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    with self._lock:
+                        self._chunks.append(data)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def received(self):
+        with self._lock:
+            return list(self._chunks)
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self._t.join(timeout=2)
+
+
 class TestFenceStrictPolicy(unittest.TestCase):
     """v0.6.1 (Issue #5): strict-by-default fence, MCP_GATE_ALLOW_PARTIAL_FENCE=1
     opt-out residual characterization, and bwrap confined smoke."""
@@ -1025,7 +1084,7 @@ class TestFenceStrictPolicy(unittest.TestCase):
             return []
 
     def _run_unreachable_fd_session(self, allow_partial):
-        sink = Sink()
+        sink = _PersistentSink()
         self._last_sink = sink
         self.addCleanup(sink.close)
         td, ws, rogue_path = self._make_td_ws("mcp-strict-")
