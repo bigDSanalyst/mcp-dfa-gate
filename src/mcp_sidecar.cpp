@@ -1090,6 +1090,18 @@ int main(int argc, char** argv) {
   const char* sec_env = std::getenv("MCP_GATE_SECCOMP");
   const bool enable_seccomp = (sec_env != nullptr && std::strcmp(sec_env, "1") == 0);
 
+  bool allow_partial_fence = false;
+  if (const char* pf = std::getenv("MCP_GATE_ALLOW_PARTIAL_FENCE")) {
+    allow_partial_fence = (std::strcmp(pf, "1") == 0);
+  }
+  if (enable_seccomp && allow_partial_fence) {
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] WARNING: MCP_GATE_ALLOW_PARTIAL_FENCE=1 -- "
+                 "sweep failures will emit FENCE WARNING and RESUME the tree "
+                 "with NO severance guarantee (mediated denies still active); "
+                 "residual ACCEPTED by operator\n");
+  }
+
   // v0.5: clearance masks are needed by both the supervisor start and the
   // quarantine-fence trigger below, so they are computed before the spawn.
   const auto net_rule = mcp_lattice::lookup_rule("http_fetch");
@@ -1130,7 +1142,7 @@ int main(int argc, char** argv) {
   }
   if (enable_seccomp) {
     if (!supervisor.start(child.seccomp_fd, &shared_taint, &shared_halted,
-                          net_clearance, exec_clearance, child.pid)) {
+                          net_clearance, exec_clearance, child.pid, allow_partial_fence)) {
       std::fprintf(stderr, "[mcp-dfa-gate] failed to start seccomp supervisor\n");
       ::close(child.handoff_sock);
       ::close(ws_fd);
