@@ -1317,7 +1317,7 @@ class TestLandlockHardening(unittest.TestCase):
         env.update(env_extra)
         extra_arg = os.path.join(ws, extra_in_ws) if extra_in_ws else "0"
         proc = subprocess.Popen(
-            [GATE_BIN, ws + "/", "--", sys.executable, rogue_path, mode, extra_arg],
+            [GATE_BIN, ws + "/", "--", sys.executable, rogue_path, mode, "0", extra_arg],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=env)
         self.addCleanup(TestFenceStrictPolicy._hard_kill, proc)
