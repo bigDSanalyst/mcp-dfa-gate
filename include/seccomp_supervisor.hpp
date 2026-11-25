@@ -611,14 +611,18 @@ class Supervisor {
     std::snprintf(path, sizeof path, "/proc/%d/stat", static_cast<int>(tid));
     FILE* f = std::fopen(path, "r");
     if (f == nullptr) {
-      return errno == ENOENT;  // gone; unreadable = unverified, NOT stopped
+      return errno == ENOENT || errno == ESRCH;  // gone; unreadable = unverified
     }
     char buf[512];
+    errno = 0;
     const char* got = std::fgets(buf, sizeof buf, f);
+    const int saved_errno = errno;
     std::fclose(f);
-    if (got == nullptr) return true;
+    if (got == nullptr) {
+      return saved_errno == ENOENT || saved_errno == ESRCH;
+    }
     const char* rp = std::strrchr(buf, ')');
-    if (rp == nullptr) return true;
+    if (rp == nullptr) return false;  // malformed/truncated = unverified, fail closed
     ++rp;
     while (*rp == ' ') ++rp;
     // 'T'/'t' = stopped. 'Z' (zombie) / 'X' (dead) hold no fds and cannot
