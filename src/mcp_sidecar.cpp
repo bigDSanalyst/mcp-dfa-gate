@@ -903,20 +903,26 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
     }
     out.handoff_sock = sv[0];
   }
-  // Confirm child Landlock/seccomp setup and execvp() succeeded (EOF on CLOEXEC pipe).
-  std::uint8_t child_err = 0;
-  ssize_t er = 0;
-  do {
-    er = ::read(exec_pipe[0], &child_err, 1);
-  } while (er < 0 && errno == EINTR);
-  ::close(exec_pipe[0]);
-  if (er > 0) {
-    if (out.seccomp_fd >= 0) { ::close(out.seccomp_fd); out.seccomp_fd = -1; }
-    if (out.handoff_sock >= 0) { ::close(out.handoff_sock); out.handoff_sock = -1; }
-    ::close(in_pipe[1]);
-    ::close(out_pipe[0]);
-    ::waitpid(pid, nullptr, 0);
-    return false;
+  // In non-seccomp mode, wait for EOF on the CLOEXEC exec_pipe to confirm
+  // child Landlock setup and execvp() succeeded synchronously.
+  // In seccomp mode, execve is USER_NOTIF-mediated (handled by Supervisor
+  // after spawn_downstream() returns), and parent_fetch_listener_fd() above
+  // already confirmed Landlock + seccomp installation succeeded.
+  if (!enable_seccomp) {
+    std::uint8_t child_err = 0;
+    ssize_t er = 0;
+    do {
+      er = ::read(exec_pipe[0], &child_err, 1);
+    } while (er < 0 && errno == EINTR);
+    ::close(exec_pipe[0]);
+    if (er > 0) {
+      ::close(in_pipe[1]);
+      ::close(out_pipe[0]);
+      ::waitpid(pid, nullptr, 0);
+      return false;
+    }
+  } else {
+    ::close(exec_pipe[0]);
   }
   out.pid = pid;
   out.to_child = in_pipe[1];
