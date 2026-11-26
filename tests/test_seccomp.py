@@ -270,7 +270,10 @@ def probe(msg):
             conn.close()
     if MODE == "dumpable":
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl.restype = ctypes.c_long
+        # prctl(2) returns int: a c_long restype reads -1 as 4294967295 on
+        # glibc builds that do not sign-extend, so the deny looked like a
+        # pass-through ("PRCTL:0") even though the filter returned EPERM.
+        libc.prctl.restype = ctypes.c_int
         if "sock" not in STATE:
             STATE["sock"] = _connect()
             os.write(STATE["sock"].fileno(), b"PRE_DUMP")

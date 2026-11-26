@@ -457,6 +457,31 @@ namespace detail {
 }
 }  // namespace detail
 
+// v0.6.3 (audit): one sensitive-name predicate shared by read_file
+// classification and bash_workspace argv vetting, so the two surfaces can no
+// longer disagree. Still a name-based oracle (see SECURITY.md residuals):
+// suffixes are matched case-insensitively on the whole path, basenames
+// exactly (case-insensitively) on the final path component.
+[[nodiscard]] bool has_sensitive_name(std::string_view path) noexcept {
+  constexpr std::array<std::string_view, 14> kSensitiveSuffixes = {
+      ".pem", ".key", ".p12", ".pfx", ".sql", ".env", ".kdbx",
+      ".jks", ".keystore", ".ppk", ".gpg", ".asc", ".ovpn", ".tfstate"};
+  for (const auto suffix : kSensitiveSuffixes) {
+    if (detail::ends_with_icase(path, suffix)) return true;
+  }
+  const std::size_t slash = path.rfind('/');
+  const std::string_view base =
+      (slash == std::string_view::npos) ? path : path.substr(slash + 1);
+  constexpr std::array<std::string_view, 10> kSensitiveBasenames = {
+      "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk",
+      "id_ed25519_sk", "credentials", "credentials.json", "secrets.json",
+      "secrets.yaml"};
+  for (const auto name : kSensitiveBasenames) {
+    if (base.size() == name.size() && detail::ends_with_icase(base, name)) return true;
+  }
+  return false;
+}
+
 [[nodiscard]] bool is_safe_workspace_path(std::string_view path, std::string_view safe_prefix) noexcept {
   if (safe_prefix.size() < 2 || safe_prefix.front() != '/' || safe_prefix.back() != '/') return false;
   if (path.size() <= safe_prefix.size() || path.back() == '/') return false;
@@ -466,11 +491,7 @@ namespace detail {
       path.find("/.") != std::string_view::npos) {
     return false;
   }
-  constexpr std::array<std::string_view, 6> blocked_suffixes = {
-      ".pem", ".key", ".p12", ".sql", ".env", ".kdbx"};
-  for (const auto suffix : blocked_suffixes) {
-    if (detail::ends_with_icase(path, suffix)) return false;
-  }
+  if (has_sensitive_name(path)) return false;
   return true;
 }
 
@@ -525,9 +546,46 @@ constexpr std::array<std::string_view, 10> kVettedCommands = {
     "ls", "cat", "head", "tail", "grep",
     "find", "wc", "diff", "stat", "sha256sum"};
 
-constexpr std::array<std::string_view, 8> kFindBlockedFlags = {
+constexpr std::array<std::string_view, 9> kFindBlockedFlags = {
     "-exec", "-execdir", "-ok", "-okdir", "-delete",
-    "-fprint", "-fprintf", "-fls"};
+    "-fprint", "-fprint0", "-fprintf", "-fls"};
+
+// v0.6.3 (audit): options that make a vetted program read files that are not
+// named in argv, so per-element vetting cannot see them (recursive grep/diff
+// over dotfiles, wc --files0-from, sha256sum --check). Short letters are
+// matched anywhere in a single-dash cluster (-rn, -nR); long names are
+// matched as GNU getopt abbreviations (--rec == --recursive). Conservative:
+// an attached short-option value containing one of the letters (e.g. -edir)
+// is also refused.
+struct ProgramOptionDeny {
+  std::string_view program;
+  std::string_view short_letters;
+  std::array<std::string_view, 4> long_names;
+};
+constexpr std::array<ProgramOptionDeny, 4> kIndirectReadOptions = {{
+    {"grep", "rRdD", {"recursive", "dereference-recursive", "directories", "devices"}},
+    {"diff", "r", {"recursive", "", "", ""}},
+    {"wc", "", {"files0-from", "", "", ""}},
+    {"sha256sum", "c", {"check", "", "", ""}},
+}};
+
+[[nodiscard]] bool option_reads_unnamed_files(std::string_view program,
+                                              std::string_view t) noexcept {
+  for (const auto& d : kIndirectReadOptions) {
+    if (d.program != program) continue;
+    if (t.size() > 2 && t[0] == '-' && t[1] == '-') {
+      const std::string_view name = t.substr(2);
+      for (const auto l : d.long_names) {
+        if (!l.empty() && l.substr(0, name.size()) == name) return true;
+      }
+      return false;
+    }
+    if (t.size() > 1 && t[0] == '-' && t[1] != '-') {
+      return t.substr(1).find_first_of(d.short_letters) != std::string_view::npos;
+    }
+  }
+  return false;
+}
 
 // v0.6 (H4 de-shell): bash_workspace takes a TYPED argv array, not a shell
 // command string. The client supplies JSON {"argv": ["ls", "-l", "."]}; the
@@ -574,6 +632,25 @@ bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_pre
   return false;
 }
 
+// v0.6.3 (audit): true if the operand names a directory beneath the
+// workspace (or "."). Relative operands resolve against the workspace root,
+// matching the downstream cwd contract. Unresolvable operands return false
+// and are left to the existing traversal/prefix/symlink checks.
+bool operand_is_directory(int ws_fd, std::string_view t, std::string_view safe_prefix) {
+  std::string rel;
+  if (!t.empty() && t[0] == '/') {
+    if (t.size() <= safe_prefix.size() || t.substr(0, safe_prefix.size()) != safe_prefix) {
+      return false;
+    }
+    rel = std::string(t.substr(safe_prefix.size()));
+  } else {
+    rel = std::string(t);
+  }
+  if (rel.empty() || rel == ".") return true;
+  struct stat st {};
+  return ::fstatat(ws_fd, rel.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode);
+}
+
 [[nodiscard]] bool argv_element_printable_ascii(std::string_view t) noexcept {
   for (const char c : t) {
     const auto u = static_cast<unsigned char>(c);
@@ -612,8 +689,17 @@ bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_pre
     }
   }
 
+  // v0.6.3 (audit): after "--" every element is an operand, even one that
+  // starts with '-'. Before this fix a '-'-prefixed element skipped the
+  // suffix, absolute-prefix and symlink checks entirely, so
+  // ["cat", "--", "-key.pem"] or a symlink named "-link" passed vetting.
+  bool end_of_options = false;
   for (std::size_t k = 1; k < argv.size(); ++k) {
     const std::string_view t = argv[k];
+    if (!end_of_options && t == "--") {
+      end_of_options = true;
+      continue;
+    }
     // Traversal substrings are rejected in every element, flags included
     // (v0.5 checked them over the whole command string; per-element keeps
     // the same coverage without the string parse).
@@ -621,20 +707,27 @@ bool token_hits_symlink(int ws_fd, std::string_view t, std::string_view safe_pre
         t.find("/.") != std::string_view::npos) {
       return false;
     }
-    if (t[0] == '-') {
+    const bool is_option = !end_of_options && t[0] == '-' && t != "-";
+    if (is_option) {
       // Flags must stay flags: no embedded paths or assignments.
       if (t.find('/') != std::string_view::npos ||
           t.find('=') != std::string_view::npos) {
         return false;
       }
-      continue;
+      if (option_reads_unnamed_files(argv[0], t)) return false;
+    } else {
+      if (t != "." && t[0] == '.') return false;  // dotfiles
+      // diff on a directory operand compares every same-named file in it,
+      // dotfiles included -- an unnamed-file read like recursive grep.
+      if (argv[0] == "diff" && t != "-" &&
+          operand_is_directory(ws_fd, t, safe_prefix)) {
+        return false;
+      }
     }
-    if (t != "." && t[0] == '.') return false;  // dotfiles
-    constexpr std::array<std::string_view, 6> blocked_suffixes = {
-        ".pem", ".key", ".p12", ".sql", ".env", ".kdbx"};
-    for (const auto suffix : blocked_suffixes) {
-      if (detail::ends_with_icase(t, suffix)) return false;
-    }
+    // Name and symlink checks apply to every element, options included: an
+    // element the gate reads as an option may still be an operand to the
+    // program (GNU getopt permutation, '--'), so they must not be skippable.
+    if (has_sensitive_name(t)) return false;
     if (t[0] == '/') {
       if (safe_prefix.empty() || t.size() <= safe_prefix.size()) return false;
       if (t.substr(0, safe_prefix.size()) != safe_prefix) return false;

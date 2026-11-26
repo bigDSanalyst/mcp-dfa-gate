@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile policy, build C++20 sidecar, and run 25 hostile tests
+      - name: Compile policy, build C++20 sidecar, and run 28 hostile tests
         run: |
           make policy
           make build
