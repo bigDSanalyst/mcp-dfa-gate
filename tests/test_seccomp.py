@@ -408,6 +408,10 @@ def safe_probe(msg):
         return "ERR:%s" % type(e).__name__
 
 
+if MODE == "execchild" and EXTRA:
+    with open(EXTRA, "w") as _rf:
+        _rf.write("READY\n")
+
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -425,7 +429,7 @@ for raw in sys.stdin:
     if MODE == "execchain" and rid == 1:
         sys.stdout.flush()
         os.execv(sys.executable,
-                 [sys.executable, os.path.abspath(sys.argv[0]), "execchild", str(PORT)])
+                 [sys.executable, os.path.abspath(sys.argv[0]), "execchild", str(PORT), EXTRA])
 
 if MODE == "enosys" and EXTRA:
     status = "ERR:no-attempt"
@@ -855,15 +859,30 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
 
     def test_exec_chain_preserves_filter(self):
         sink = Sink()
+        proc = None
         try:
-            statuses, _ = self._session("execchain", sink.port,
-                                        files=("readme.txt", "secret.env", "readme.txt"))
-            self.assertEqual(statuses[0], "OK")
-            for i in (1, 2):
-                self.assertTrue(statuses[i].startswith("EPERM:"),
-                                f"post-exec probe {i + 1} exfiltrated: {statuses[i]}")
+            td = tempfile.mkdtemp(prefix="mcp-seccomp-exec-")
+            self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+            ready_file = os.path.join(td, "exec_ready.txt")
+            proc, ws, _, err = self._start_rogue("execchain", sink.port,
+                                                 extra_args=(ready_file,))
+            r1 = self._call(proc, 1, ws, "readme.txt")
+            self.assertEqual(r1["result"]["status"], "OK")
+            deadline = time.time() + 5.0
+            while not os.path.exists(ready_file) and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(ready_file),
+                            f"execchild never signaled readiness; stderr={err[-8:]!r}")
+            r2 = self._call(proc, 2, ws, "secret.env")
+            r3 = self._call(proc, 3, ws, "readme.txt")
+            for i, resp in ((1, r2), (2, r3)):
+                st = resp["result"]["status"]
+                self.assertTrue(st.startswith("EPERM:"),
+                                f"post-exec probe {i + 1} exfiltrated: {st}")
             self.assertEqual(sink.received(), [])
         finally:
+            if proc is not None:
+                self._shutdown(proc)
             sink.close()
 
     # ---------- fail-mode ----------
@@ -880,6 +899,9 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
                                                extra_args=(status_file,))
             resp = self._call(proc, 1, ws, "readme.txt")
             self.assertEqual(resp["result"]["status"], "OK")
+            b_deadline = time.time() + 2.0
+            while b"".join(sink.received()) != b"BASELINE" and time.time() < b_deadline:
+                time.sleep(0.02)
             self.assertEqual(b"".join(sink.received()), b"BASELINE")
             proc.kill()  # SIGKILL: supervisor dies mid-session
             proc.wait(timeout=5)
