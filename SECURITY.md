@@ -1,4 +1,4 @@
-# Security Model and Trust Boundaries (mcp-dfa-gate v0.6.2)
+# Security Model and Trust Boundaries (mcp-dfa-gate v0.6.3)
 
 ## 1. Formally Verified Properties (Lean 4)
 `lean/lattice_proof.lean` proves two universal theorems over all 64-bit taint-lattice policies and arbitrary-length traces (no Mathlib, no `sorry`, no `native_decide`):
@@ -24,7 +24,13 @@ Implemented in `include/seccomp_supervisor.hpp` and verified live on Linux in `t
 * **Linearization contract:** a byte can leave the host only if its write syscall completed (queued to the socket buffer) before the fence's `shutdown()` of that socket object. Every write issued after the fence resumes fails (`EPIPE`, or `EDESTADDRREQ` on unconnected UDP which cannot transmit without the mediated `connect`/`sendto`/`sendmsg`).
 * **FENCE FAILURE policy (v0.5.1, fail closed):** if any tracked thread group cannot be verifiably stopped after bounded retries (a process that never settles in `T` state -- e.g. one stuck in uninterruptible `D` sleep -- or an unreadable `/proc`), or descendant discovery cannot converge (tracking cap exceeded), the fence stores the new taint (mediated denies still hold for every remaining process), leaves the tree SIGSTOPped -- never resumes an unverified process -- and reports failure; the sidecar then SIGKILLs the tracked tree and exits with code **43**. Severance claims are never made on an unverified freeze.
 * **Fail-closed properties:** if the supervisor or sidecar dies, the listener FD closes and every mediated syscall in the tree returns `ENOSYS` (verified by test). If pid tracking hits its cap (1024), untracked pids are denied at mediation time. The fence is idempotent and re-runs on any further taint growth. The sidecar refuses to start (exit 3) under `MCP_GATE_SECCOMP=1` if `prctl(PR_SET_CHILD_SUBREAPER)` fails, because fence descendant discovery depends on it.
-* Note: Linux allows only one `SECCOMP_RET_USER_NOTIF` listener per filter chain; nested container runtimes that already hold a listener will return `EBUSY`.
+* Note: Linux allows only one `SECCOMP_RET_USER_NOTIF` listener per filter chain; nested container runtimes that already hold a listener will return `EBUSY`. Since v0.6.3 the gate reports this at startup -- exit 3 with a diagnostic naming the outer listener (observed on Google Colab) -- instead of a generic spawn failure.
+
+## 3a. v0.6.3 Indirect-Read Vetting (audit)
+* Options that make a vetted program read files not named in `argv` are content violations (`-32001` plus absorption): `grep` `-r`/`-R`/`-d`/`-D` (anywhere in a short cluster) and long-option prefixes of `--recursive`, `--dereference-recursive`, `--directories`, `--devices`; `diff -r`/`--recursive` and any `diff` directory operand; `wc --files0-from`; `sha256sum -c`/`--check`. `find -fprint0` joins the side-effect deny list.
+* After `--`, every element is an operand. Sensitive-name and symlink checks apply to every element regardless of a leading `-`.
+* `read_file` classification and argv vetting share one sensitive-name predicate (`has_sensitive_name`).
+* **Residual:** sensitivity remains name-based, and option vetting remains a per-program denylist. Content stored under an ordinary filename is not tainted by reading it.
 
 ## 4. Out-of-Scope / Caller Responsibilities
 * **Downstream `cwd` and filesystem confinement:** Deployers must confine the downstream server inside `SAFE_PREFIX` (see `scripts/run_confined.sh` using `bwrap`). Adding `--unshare-net` to the bwrap invocation removes the pre-taint localhost exfil surface entirely (it also breaks legitimate untainted networking and the live test suite, so it is not the default).

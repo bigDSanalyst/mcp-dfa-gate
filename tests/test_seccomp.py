@@ -22,9 +22,17 @@ Coverage map (audit finding -> test):
   fail-closed supervisor death                -> test_supervisor_death_fails_closed
   listener fd hygiene                         -> test_fd_hygiene_no_listener_leak
   taint-raise race                            -> test_taint_raise_race_hammer
+  exec failure under seccomp (audit F-02)     -> test_seccomp_exec_failure_refused_at_startup
+  startup refusal names its cause (v0.6.3)    -> test_outer_seccomp_listener_refused_with_cause
+                                                test_pidfd_getfd_denied_refused_with_cause
   non-local fs pin (procfs proxy)             -> test_pseudo_fs_workspace_refused
                                                 test_pseudo_fs_override_env_starts
   v0.4 regressions                            -> tcp / udp / exec tests (retained)
+
+Hosts that cannot arm the gate's seccomp sandbox at all (an outer seccomp
+listener such as Google Colab's, or pidfd_getfd denied) skip every test that
+sets MCP_GATE_SECCOMP=1 when run locally, and fail them on CI (CI=true), where
+an incapable host is a coverage gap -- see require_seccomp_host().
 """
 import errno
 import json
@@ -270,7 +278,10 @@ def probe(msg):
             conn.close()
     if MODE == "dumpable":
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl.restype = ctypes.c_long
+        # prctl(2) returns int: a c_long restype reads -1 as 4294967295 on
+        # glibc builds that do not sign-extend, so the deny looked like a
+        # pass-through ("PRCTL:0") even though the filter returned EPERM.
+        libc.prctl.restype = ctypes.c_int
         if "sock" not in STATE:
             STATE["sock"] = _connect()
             os.write(STATE["sock"].fileno(), b"PRE_DUMP")
@@ -465,6 +476,157 @@ def assert_channel_severed(tc, status, ctx):
     tc.assertTrue(ok, f"{ctx}: channel not severed, got {status}")
 
 
+# ---------- host capability guard (v0.6.3) ----------
+#
+# Can this host arm the gate's seccomp sandbox at all? Two known "no" hosts:
+# one whose sandbox already supervises its processes with a seccomp listener
+# (EBUSY: Linux allows one per filter chain; observed on Google Colab), and
+# one that denies pidfd_getfd(2) (EPERM). The probe runs the same three steps
+# the gate's handoff needs, in a fresh interpreter, and is deliberately
+# independent of the gate binary: a gate regression must still FAIL these
+# tests, never turn them into skips.
+HOST_SECCOMP_PROBE = r"""
+import ctypes, errno, os, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.prctl.restype = ctypes.c_int
+nr = {"x86_64": 317, "aarch64": 277}.get(platform.machine())
+if nr is None:
+    print("unsupported architecture: " + platform.machine())
+    sys.exit(0)
+
+
+class F(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+                ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class P(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(F))]
+
+
+def failed(step):
+    e = ctypes.get_errno()
+    return "%s -> %s (%s)" % (step, errno.errorcode.get(e, str(e)), os.strerror(e))
+
+
+r, w = os.pipe()
+go_r, go_w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(r)
+    os.close(go_w)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:                       # PR_SET_NO_NEW_PRIVS
+        msg = failed("prctl(PR_SET_NO_NEW_PRIVS)")
+    else:
+        allow = (F * 1)(F(0x06, 0, 0, 0x7FFF0000))             # RET_ALLOW
+        fd = libc.syscall(ctypes.c_long(nr), ctypes.c_long(1),  # SET_MODE_FILTER
+                          ctypes.c_long(8),                     # NEW_LISTENER
+                          ctypes.byref(P(1, allow)))
+        msg = ("OK %d" % fd) if fd >= 0 else failed(
+            "seccomp(SECCOMP_FILTER_FLAG_NEW_LISTENER)")
+    os.write(w, msg.encode())
+    os.read(go_r, 1)
+    os._exit(0)
+os.close(w)
+os.close(go_r)
+msg = os.read(r, 512).decode()
+if msg.startswith("OK "):
+    pidfd = libc.syscall(ctypes.c_long(434), ctypes.c_long(pid), ctypes.c_long(0))
+    if pidfd < 0:
+        msg = failed("pidfd_open")
+    else:
+        got = libc.syscall(ctypes.c_long(438), ctypes.c_long(pidfd),
+                           ctypes.c_long(int(msg.split()[1])), ctypes.c_long(0))
+        msg = "OK" if got >= 0 else failed("pidfd_getfd")
+os.write(go_w, b"x")
+os.waitpid(pid, 0)
+print(msg)
+"""
+
+_host_seccomp_verdict = None
+
+
+def host_seccomp_unavailable_reason():
+    """None if this host can arm the gate's seccomp sandbox, else why not."""
+    global _host_seccomp_verdict
+    if _host_seccomp_verdict is None:
+        try:
+            p = subprocess.run([sys.executable, "-I", "-c", HOST_SECCOMP_PROBE],
+                               capture_output=True, text=True, timeout=20)
+            lines = p.stdout.strip().splitlines()
+            out = lines[-1] if lines else ""
+            if p.returncode == 0 and out == "OK":
+                _host_seccomp_verdict = ""
+            else:
+                _host_seccomp_verdict = out or ("probe exited %d: %s" % (
+                    p.returncode, p.stderr.strip()[-200:]))
+        except (OSError, subprocess.SubprocessError) as e:
+            _host_seccomp_verdict = "probe could not run: %r" % (e,)
+    return _host_seccomp_verdict or None
+
+
+def require_seccomp_host(tc):
+    """Skip locally, fail on CI, when the host cannot arm the sandbox.
+
+    Same policy as the Landlock tests: on CI an incapable host is a coverage
+    gap, not a skip."""
+    reason = host_seccomp_unavailable_reason()
+    if reason is None:
+        return
+    if "EBUSY" in reason:
+        reason += (": another seccomp listener already supervises this host's "
+                   "processes (e.g. Google Colab)")
+    msg = "host cannot arm the gate's seccomp sandbox: " + reason
+    if os.environ.get("CI") == "true":
+        tc.fail(msg + " -- coverage gap on CI, not a skip")
+    tc.skipTest(msg)
+
+
+# Runs argv under an "outer sandbox" seccomp filter, mimicking the two hosts
+# the probe above detects: "listener" holds an allow-all filter with its own
+# listener open (as Colab's sandbox does); "deny_getfd" denies pidfd_getfd(2)
+# with EPERM (as a restrictive container profile can). Exit status is the
+# wrapped program's.
+OUTER_FILTER_WRAPPER = r"""
+import ctypes, os, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.prctl.restype = ctypes.c_int
+
+
+class F(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+                ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class P(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(F))]
+
+
+kind, argv = sys.argv[1], sys.argv[2:]
+if kind == "listener":
+    prog = (F * 1)(F(0x06, 0, 0, 0x7FFF0000))       # RET_ALLOW
+    flags = 8                                        # SECCOMP_FILTER_FLAG_NEW_LISTENER
+else:
+    prog = (F * 4)(F(0x20, 0, 0, 0),                 # A = seccomp_data.nr
+                   F(0x15, 0, 1, 438),               # A == pidfd_getfd ?
+                   F(0x06, 0, 0, 0x00050001),        # RET_ERRNO | EPERM
+                   F(0x06, 0, 0, 0x7FFF0000))        # RET_ALLOW
+    flags = 0
+libc.prctl(38, 1, 0, 0, 0)                           # PR_SET_NO_NEW_PRIVS
+nr = {"x86_64": 317, "aarch64": 277}[platform.machine()]
+if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_long(flags),
+                ctypes.byref(P(len(prog), prog))) < 0:
+    sys.exit("outer filter install failed: errno %d" % ctypes.get_errno())
+pid = os.fork()      # this process keeps the listener open while argv runs
+if pid == 0:
+    os.execv(argv[0], argv)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""
+
+
 class Sink:
     """Threaded TCP / UDP / abstract-UNIX listener recording payloads."""
 
@@ -538,6 +700,8 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
     # ---------- harness ----------
 
     def _start_rogue(self, mode, port=0, extra_args=(), seccomp=True):
+        if seccomp:
+            require_seccomp_host(self)
         td = tempfile.mkdtemp(prefix=f"mcp-seccomp-{mode}-")
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         ws = os.path.join(td, "ws")
@@ -968,6 +1132,62 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
         self.assertIn(b"not on a local filesystem", proc.stderr)
         self.assertIn(b"procfs", proc.stderr)
 
+    def test_seccomp_exec_failure_refused_at_startup(self):
+        """v0.6.3 (audit F-02): under MCP_GATE_SECCOMP=1 the exec-status pipe
+        used to be closed unread, so a downstream that could not exec was
+        only noticed at the first forwarded call -- and with no calls the
+        gate exited 0. Startup must now refuse with exit 3 and a
+        diagnostic."""
+        require_seccomp_host(self)
+        td = tempfile.mkdtemp(prefix="mcp-seccomp-noexec-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        env = os.environ.copy()
+        env["MCP_GATE_SECCOMP"] = "1"
+        proc = subprocess.run(
+            [GATE_BIN, td + "/", "--", os.path.join(td, "no-such-server")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, timeout=20)
+        self.assertEqual(proc.returncode, 3,
+                         f"expected startup refusal; stderr={proc.stderr[-300:]!r}")
+        self.assertIn(b"failed to exec under seccomp", proc.stderr)
+        self.assertIn(b"child status 127", proc.stderr)
+
+    # ---------- startup diagnostics (v0.6.3) ----------
+
+    def _gate_under_outer_filter(self, kind):
+        td = tempfile.mkdtemp(prefix="mcp-seccomp-outer-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        env = os.environ.copy()
+        env["MCP_GATE_SECCOMP"] = "1"
+        return subprocess.run(
+            [sys.executable, "-I", "-c", OUTER_FILTER_WRAPPER, kind, GATE_BIN,
+             td + "/", "--", sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, timeout=30)
+
+    def test_outer_seccomp_listener_refused_with_cause(self):
+        """v0.6.3: inside a sandbox that already supervises its processes
+        with a seccomp listener (observed on Google Colab), the kernel
+        refuses the gate's own listener with EBUSY -- one listener per
+        filter chain. The gate must refuse to start (exit 3) and say why;
+        before v0.6.3 it printed only a generic spawn failure."""
+        require_seccomp_host(self)
+        proc = self._gate_under_outer_filter("listener")
+        self.assertEqual(proc.returncode, 3, proc.stderr[-400:])
+        self.assertIn(b"another seccomp listener", proc.stderr)
+        self.assertNotIn(b"SECCOMP_UNOTIFY ACTIVE", proc.stderr)
+
+    def test_pidfd_getfd_denied_refused_with_cause(self):
+        """v0.6.3: a host that denies pidfd_getfd(2) (some container seccomp
+        profiles, kernel.yama.ptrace_scope >= 2, LSMs) breaks the listener
+        handoff and the fence sweep alike. The gate must refuse to start
+        (exit 3) and name pidfd_getfd as the cause."""
+        require_seccomp_host(self)
+        proc = self._gate_under_outer_filter("deny_getfd")
+        self.assertEqual(proc.returncode, 3, proc.stderr[-400:])
+        self.assertIn(b"pidfd_getfd(listener) failed", proc.stderr)
+        self.assertIn(b"Operation not permitted", proc.stderr)
+
     def test_pseudo_fs_override_env_starts(self):
         env = os.environ.copy()
         env["MCP_GATE_ALLOW_NETFS"] = "1"
@@ -1131,6 +1351,7 @@ class TestFenceStrictPolicy(unittest.TestCase):
             return []
 
     def _run_unreachable_fd_session(self, allow_partial):
+        require_seccomp_host(self)
         sink = _PersistentSink()
         self._last_sink = sink
         self.addCleanup(sink.close)
@@ -1240,6 +1461,7 @@ class TestFenceStrictPolicy(unittest.TestCase):
                       "opt-out residual not demonstrated at sink")
 
     def _confined_preconn(self, env_extra, sink):
+        require_seccomp_host(self)
         td, ws, _ = self._make_td_ws("mcp-bwrap-")
         rogue_path = os.path.join(ws, "rogue.py")
         with open(rogue_path, "w") as f:
@@ -1402,6 +1624,7 @@ class TestLandlockHardening(unittest.TestCase):
     def test_landlock_combined_with_seccomp(self):
         """MCP_GATE_LANDLOCK=1 composes cleanly with MCP_GATE_SECCOMP=1."""
         self._require_landlock()
+        require_seccomp_host(self)
         rc, s1, s2, err = self._run_landlock(
             {"MCP_GATE_LANDLOCK": "1", "MCP_GATE_SECCOMP": "1"})
         self.assertEqual(rc, 0, f"unexpected exit {rc}; {err[-8:]!r}")
