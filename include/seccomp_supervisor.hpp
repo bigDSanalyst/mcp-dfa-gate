@@ -112,10 +112,35 @@ inline constexpr std::uint32_t kExpectedArch = AUDIT_ARCH_AARCH64;
   BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(NR), 0, 1), \
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
 
-// Child installs BPF filter, writes listener FD integer over unfiltered SYS_write,
-// and blocks on SYS_read until parent duplicates the FD and starts the supervisor.
+// v0.6.3: handoff report, child -> parent over the socketpair. On failure the
+// child reports the failing step and its errno before exiting, so the parent
+// can name the cause instead of a generic spawn failure -- e.g. EBUSY when an
+// outer sandbox already holds a seccomp listener (one per filter chain).
+struct HandoffMsg {
+  std::int32_t listener_fd;  // >= 0 on success, -1 on failure
+  std::int32_t stage;        // HandoffStage of the failing step
+  std::int32_t err;          // errno of the failing step
+};
+enum HandoffStage : std::int32_t {
+  kHandoffOk = 0,
+  kHandoffNoNewPrivs = 1,
+  kHandoffSeccomp = 2,
+};
+
+// Post-fork child context: write(2) only, no allocation.
+inline void child_report_handoff(int sock, std::int32_t fd, std::int32_t stage,
+                                 std::int32_t err) noexcept {
+  const HandoffMsg m{fd, stage, err};
+  const ssize_t ignored = ::write(sock, &m, sizeof m);
+  (void)ignored;
+}
+
+// Child installs BPF filter, writes its handoff report (listener FD number)
+// over unfiltered SYS_write, and blocks on SYS_read until parent duplicates
+// the FD and starts the supervisor.
 inline bool child_install_and_handoff(int sock) noexcept {
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    child_report_handoff(sock, -1, kHandoffNoNewPrivs, errno);
     return false;
   }
   struct sock_filter filter[] = {
@@ -219,11 +244,13 @@ inline bool child_install_and_handoff(int sock) noexcept {
   const long listener_fd = ::syscall(
       SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
   if (listener_fd < 0) {
+    child_report_handoff(sock, -1, kHandoffSeccomp, errno);
     return false;
   }
 
   const int fd_num = static_cast<int>(listener_fd);
-  if (::write(sock, &fd_num, sizeof(fd_num)) != static_cast<ssize_t>(sizeof(fd_num))) {
+  const HandoffMsg ok_msg{fd_num, kHandoffOk, 0};
+  if (::write(sock, &ok_msg, sizeof ok_msg) != static_cast<ssize_t>(sizeof ok_msg)) {
     ::close(fd_num);
     return false;
   }
@@ -237,19 +264,68 @@ inline bool child_install_and_handoff(int sock) noexcept {
 #undef MCP_GATE_MEDIATE
 #undef MCP_GATE_DENY
 
-// Parent reads child's listener FD number and duplicates it via pidfd_getfd (no sendmsg).
+// Parent reads the child's handoff report and duplicates the listener FD via
+// pidfd_getfd (no sendmsg). v0.6.3: every failure prints its cause.
 inline int parent_fetch_listener_fd(int sock, pid_t child_pid) noexcept {
-  int child_fd = -1;
-  if (::read(sock, &child_fd, sizeof(child_fd)) != static_cast<ssize_t>(sizeof(child_fd))) {
+  HandoffMsg m{-1, -1, 0};
+  ssize_t n = 0;
+  do {
+    n = ::read(sock, &m, sizeof m);
+  } while (n < 0 && errno == EINTR);
+  if (n != static_cast<ssize_t>(sizeof m)) {
+    const int e = errno;
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] seccomp handoff: no report from the downstream "
+                 "child (%s)\n",
+                 n == 0 ? "it exited before installing the filter"
+                        : (n < 0 ? std::strerror(e) : "truncated report"));
+    return -1;
+  }
+  if (m.listener_fd < 0) {
+    const int e = m.err;
+    const char* what = (m.stage == kHandoffNoNewPrivs)
+                           ? "set PR_SET_NO_NEW_PRIVS"
+                           : "install its seccomp listener filter";
+    const char* hint = "";
+    if (m.stage == kHandoffSeccomp && e == EBUSY) {
+      hint = " -- another seccomp listener already supervises this process "
+             "tree (e.g. a container or notebook sandbox such as Google "
+             "Colab). Linux allows one listener per filter chain, so "
+             "MCP_GATE_SECCOMP=1 cannot run here (SECURITY.md section 3)";
+    } else if (m.stage == kHandoffSeccomp && e == EINVAL) {
+      hint = " -- the kernel rejected SECCOMP_FILTER_FLAG_NEW_LISTENER or the "
+             "filter (supported floor: Linux 5.9)";
+    }
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] seccomp handoff: child could not %s: errno %d "
+                 "(%s)%s\n",
+                 what, e, std::strerror(e), hint);
     return -1;
   }
   const long pidfd = ::syscall(SYS_pidfd_open, child_pid, 0U);
   if (pidfd < 0) {
+    const int e = errno;
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] seccomp handoff: pidfd_open(child) failed: "
+                 "errno %d (%s)\n",
+                 e, std::strerror(e));
     return -1;
   }
-  const long dup_fd = ::syscall(SYS_pidfd_getfd, static_cast<int>(pidfd), child_fd, 0U);
+  const long dup_fd =
+      ::syscall(SYS_pidfd_getfd, static_cast<int>(pidfd), m.listener_fd, 0U);
+  const int getfd_errno = errno;
   ::close(static_cast<int>(pidfd));
-  return (dup_fd >= 0) ? static_cast<int>(dup_fd) : -1;
+  if (dup_fd < 0) {
+    std::fprintf(stderr,
+                 "[mcp-dfa-gate] seccomp handoff: pidfd_getfd(listener) failed: "
+                 "errno %d (%s) -- the gate needs ptrace-level access to its own "
+                 "child (PTRACE_MODE_ATTACH_REALCREDS), which the fence sweep "
+                 "also uses; a container seccomp profile, "
+                 "kernel.yama.ptrace_scope >= 2, or an LSM can deny it\n",
+                 getfd_errno, std::strerror(getfd_errno));
+    return -1;
+  }
+  return static_cast<int>(dup_fd);
 }
 
 class Supervisor {

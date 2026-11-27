@@ -5,6 +5,7 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
 ## Requirements
 
 * **Linux 5.9+** (verified on Linux 5.10 locally and Linux 6.x on GitHub Actions CI)
+* **For `MCP_GATE_SECCOMP=1`, a host that lets the gate install its own seccomp listener:** Linux allows one listener per filter chain, so the gate cannot run inside a sandbox that already supervises its processes this way (observed on Google Colab), and it needs `pidfd_getfd(2)` access to its own child. On such hosts it refuses at startup (exit **3**) and prints the cause.
 * C++20 compiler (`g++` / `clang++`) and Python 3.10+ (for policy compilation and tests)
 * Optional: Lean 4 (for re-checking `lean/lattice_proof.lean`)
 
@@ -31,7 +32,7 @@ Zero-dependency C++20 `stdio` JSON-RPC security sidecar for Model Context Protoc
 make policy        # Compile policies/enterprise_example.json -> C++20 + Lean 4
 make build         # Compile mcp-dfa-gate (-std=c++20 -O2 -Wall -Wextra -Wpedantic -pthread)
 make test          # Run 28 hostile integration tests (tests/test_sidecar.py) -> 28/28
-make test-seccomp  # Run 29 live-kernel red-team tests (tests/test_seccomp.py) -> 29/29
+make test-seccomp  # Run 32 live-kernel red-team tests (tests/test_seccomp.py); some skip without root, bubblewrap or Landlock
 make verify        # Check Lean 4 universal Non-Interference proof
 ```
 
@@ -91,6 +92,7 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 * **Wider sensitive-name oracle, shared by `read_file` and `bash_workspace`:** adds `.pfx .jks .keystore .ppk .gpg .asc .ovpn .tfstate` and the basenames `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` (and `_sk` variants), `credentials`, `credentials.json`, `secrets.json`, `secrets.yaml`. Against v0.6.2, `read_file` of `id_rsa` left the session untainted.
 * **Conservative side effects:** a `grep` short-option cluster containing `r`, `R`, `d` or `D` is refused even when the letter is part of an attached value (e.g. `-edir`); pass the value as a separate element instead.
 * **Exec failure is refused at startup under `MCP_GATE_SECCOMP=1` (audit F-02):** the exec-status pipe was closed unread in seccomp mode, so a downstream that could not exec was only noticed at the first forwarded call (and a session with no calls exited 0). The gate now reads it after the handoff and exits **3** with `downstream failed to exec under seccomp`.
+* **Seccomp startup refusals name their cause:** when the gate cannot install its listener because another seccomp listener already supervises the process tree (`EBUSY`, observed on Google Colab), or cannot fetch it because `pidfd_getfd` is denied (`EPERM`), it now prints that cause before the generic spawn failure (still exit **3**). `tests/test_seccomp.py` probes the host first: where the sandbox cannot be armed, seccomp tests skip locally and fail on CI.
 * **CI supply chain:** `actions/checkout` pinned by commit SHA (v6.1.0); the elan installer is fetched from tag `v4.4.0` and checked against its SHA-256 instead of piping unpinned `master` into `sh`.
 * **Test fix:** `tests/test_seccomp.py` declared `prctl`'s return type as `c_long`; on glibc builds that do not sign-extend the `int` result, the `EPERM` deny read as `4294967295` and the test failed with `PRCTL:0` although the filter was correct.
 
