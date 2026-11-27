@@ -22,6 +22,7 @@ Coverage map (audit finding -> test):
   fail-closed supervisor death                -> test_supervisor_death_fails_closed
   listener fd hygiene                         -> test_fd_hygiene_no_listener_leak
   taint-raise race                            -> test_taint_raise_race_hammer
+  exec failure under seccomp (audit F-02)     -> test_seccomp_exec_failure_refused_at_startup
   non-local fs pin (procfs proxy)             -> test_pseudo_fs_workspace_refused
                                                 test_pseudo_fs_override_env_starts
   v0.4 regressions                            -> tcp / udp / exec tests (retained)
@@ -970,6 +971,25 @@ class TestSeccompKernelEnforcement(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, "gate must refuse non-local workspace")
         self.assertIn(b"not on a local filesystem", proc.stderr)
         self.assertIn(b"procfs", proc.stderr)
+
+    def test_seccomp_exec_failure_refused_at_startup(self):
+        """v0.6.3 (audit F-02): under MCP_GATE_SECCOMP=1 the exec-status pipe
+        used to be closed unread, so a downstream that could not exec was
+        only noticed at the first forwarded call -- and with no calls the
+        gate exited 0. Startup must now refuse with exit 3 and a
+        diagnostic."""
+        td = tempfile.mkdtemp(prefix="mcp-seccomp-noexec-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        env = os.environ.copy()
+        env["MCP_GATE_SECCOMP"] = "1"
+        proc = subprocess.run(
+            [GATE_BIN, td + "/", "--", os.path.join(td, "no-such-server")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, timeout=20)
+        self.assertEqual(proc.returncode, 3,
+                         f"expected startup refusal; stderr={proc.stderr[-300:]!r}")
+        self.assertIn(b"failed to exec under seccomp", proc.stderr)
+        self.assertIn(b"child status 127", proc.stderr)
 
     def test_pseudo_fs_override_env_starts(self):
         env = os.environ.copy()

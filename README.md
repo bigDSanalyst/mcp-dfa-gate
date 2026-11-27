@@ -90,6 +90,8 @@ MCP_GATE_SECCOMP=1 ./scripts/run_confined.sh /workspace/public -- python3 -m you
 * **`find -fprint0` denied** alongside `-fprint`/`-fprintf`/`-fls`.
 * **Wider sensitive-name oracle, shared by `read_file` and `bash_workspace`:** adds `.pfx .jks .keystore .ppk .gpg .asc .ovpn .tfstate` and the basenames `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` (and `_sk` variants), `credentials`, `credentials.json`, `secrets.json`, `secrets.yaml`. Against v0.6.2, `read_file` of `id_rsa` left the session untainted.
 * **Conservative side effects:** a `grep` short-option cluster containing `r`, `R`, `d` or `D` is refused even when the letter is part of an attached value (e.g. `-edir`); pass the value as a separate element instead.
+* **Exec failure is refused at startup under `MCP_GATE_SECCOMP=1` (audit F-02):** the exec-status pipe was closed unread in seccomp mode, so a downstream that could not exec was only noticed at the first forwarded call (and a session with no calls exited 0). The gate now reads it after the handoff and exits **3** with `downstream failed to exec under seccomp`.
+* **CI supply chain:** `actions/checkout` pinned by commit SHA (v6.1.0); the elan installer is fetched from tag `v4.4.0` and checked against its SHA-256 instead of piping unpinned `master` into `sh`.
 * **Test fix:** `tests/test_seccomp.py` declared `prctl`'s return type as `c_long`; on glibc builds that do not sign-extend the `int` result, the `EPERM` deny read as `4294967295` and the test failed with `PRCTL:0` although the filter was correct.
 
 ## Known Residuals

@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by commit (v6.1.0): a tag can be moved, a SHA cannot.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Compile policy, build C++20 sidecar, and run 28 hostile tests
         run: |
@@ -33,8 +34,15 @@ jobs:
 
       - name: Install Lean 4 and verify universal Non-Interference proof
         run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
+          # elan installer pinned to tag v4.4.0 and checked against its
+          # SHA-256 before it runs (was: unpinned master piped into sh).
+          curl -sSfL -o elan-init.sh https://raw.githubusercontent.com/leanprover/elan/v4.4.0/elan-init.sh
+          echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  elan-init.sh" | sha256sum -c -
+          sh elan-init.sh -y
           export PATH="$HOME/.elan/bin:$PATH"
+          # Toolchain is still elan's default (stable); this line records which
+          # Lean version checked the proof so it can be pinned in a follow-up.
+          lean --version
           make verify | tee lean_out.txt
           if grep -q "sorryAx" lean_out.txt; then
             echo "ERROR: sorryAx detected in Lean proof"

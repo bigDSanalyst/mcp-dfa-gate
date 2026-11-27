@@ -908,6 +908,10 @@ struct Child {
   int from_child = -1;
   int seccomp_fd = -1;
   int handoff_sock = -1;
+  // v0.6.3 (audit F-02): seccomp mode keeps the CLOEXEC exec-status pipe
+  // open until main() has acked the handoff, then reads it, so a downstream
+  // that fails between the handoff and execvp() is refused at startup.
+  int exec_status_fd = -1;
 };
 
 bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
@@ -998,9 +1002,11 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
   }
   // In non-seccomp mode, wait for EOF on the CLOEXEC exec_pipe to confirm
   // child Landlock setup and execvp() succeeded synchronously.
-  // In seccomp mode, execve is USER_NOTIF-mediated (handled by Supervisor
-  // after spawn_downstream() returns), and parent_fetch_listener_fd() above
-  // already confirmed Landlock + seccomp installation succeeded.
+  // In seccomp mode, execve is USER_NOTIF-mediated, so the pipe can only be
+  // read once the supervisor is running and the handoff is acked (reading
+  // it here would deadlock: the child is still blocked on the ack).
+  // v0.6.3 (audit F-02): the read end is handed to main() via
+  // exec_status_fd instead of being closed unread.
   if (!enable_seccomp) {
     std::uint8_t child_err = 0;
     ssize_t er = 0;
@@ -1015,7 +1021,7 @@ bool spawn_downstream(const std::vector<std::string>& cmdv, Child& out,
       return false;
     }
   } else {
-    ::close(exec_pipe[0]);
+    out.exec_status_fd = exec_pipe[0];
   }
   out.pid = pid;
   out.to_child = in_pipe[1];
@@ -1306,6 +1312,29 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "[mcp-dfa-gate] seccomp handoff ACK failed\n");
       ::close(ws_fd);
       return 3;
+    }
+    // v0.6.3 (audit F-02): confirm execvp() succeeded. The supervisor is
+    // running, so the child's mediated execve is answered (taint is 0);
+    // success closes the CLOEXEC pipe (EOF), failure writes the child's
+    // exit code (126 setup, 127 exec) before _exit.
+    {
+      std::uint8_t child_err = 0;
+      ssize_t er = 0;
+      do {
+        er = ::read(child.exec_status_fd, &child_err, 1);
+      } while (er < 0 && errno == EINTR);
+      ::close(child.exec_status_fd);
+      child.exec_status_fd = -1;
+      if (er != 0) {
+        std::fprintf(stderr,
+                     "[mcp-dfa-gate] downstream failed to exec under seccomp "
+                     "(child status %u); refusing to start\n",
+                     er > 0 ? static_cast<unsigned>(child_err) : 0u);
+        ::kill(child.pid, SIGKILL);
+        ::waitpid(child.pid, nullptr, 0);
+        ::close(ws_fd);
+        return 3;
+      }
     }
     std::fprintf(stderr,
                  "[mcp-dfa-gate] SECCOMP_UNOTIFY ACTIVE (net=0x%016llx exec=0x%016llx)\n",
